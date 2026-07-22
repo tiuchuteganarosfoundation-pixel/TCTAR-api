@@ -2,7 +2,11 @@ from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
+import os
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 from database import engine, get_db
 from id_generator import generate_employee_id
@@ -16,6 +20,40 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ============================================================
+# EMAIL SENDING (Gmail SMTP)
+# Requires two environment variables set on Render:
+#   EMAIL_ADDRESS       - the Gmail address sending on behalf of the school
+#   EMAIL_APP_PASSWORD  - the 16-character Google App Password (NOT the login password)
+# If either is missing, emails are skipped (logged, not sent) so the
+# rest of the API keeps working even before email is configured.
+# ============================================================
+
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD")
+EMAIL_FROM_NAME = "Tiu Cho Teg - Ana Ros Foundation Integrated Farm School"
+
+def send_email(to_email: Optional[str], subject: str, body: str):
+    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
+        print(f"[email skipped - not configured] to={to_email} subject={subject}")
+        return
+    if not to_email:
+        print(f"[email skipped - no recipient] subject={subject}")
+        return
+    msg = MIMEMultipart()
+    msg["From"] = f"{EMAIL_FROM_NAME} <{EMAIL_ADDRESS}>"
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+            server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
+        print(f"[email sent] to={to_email} subject={subject}")
+    except Exception as e:
+        print(f"[email FAILED] to={to_email} subject={subject} error={e}")
 
 
 # ============================================================
@@ -522,3 +560,295 @@ def delete_testimonial(testimonial_id: int, db: Session = Depends(get_db)):
     db.execute(text("DELETE FROM website_testimonials WHERE id = :id"), {"id": testimonial_id})
     db.commit()
     return {"message": "Testimonial deleted"}
+
+
+# ============================================================
+# APPLICATIONS (enrollment submissions -> registrar review)
+# ============================================================
+
+class ApplicationCreate(BaseModel):
+    application_type: str          # 'regular' or 'als'
+    first_name: str
+    last_name: str
+    email: Optional[str] = None
+    phone_number: Optional[str] = None
+    grade_level: str
+    requirement_ids_declared: List[int] = []
+
+# ---- PUBLIC: enrollment forms submit here ----
+@app.post("/applications")
+def create_application(payload: ApplicationCreate, db: Session = Depends(get_db)):
+    if payload.application_type not in ("regular", "als"):
+        raise HTTPException(status_code=400, detail="application_type must be 'regular' or 'als'")
+
+    # 1. Create the student record
+    db.execute(text("""
+        INSERT INTO students (first_name, last_name, email, phone_number, enrollment_status)
+        VALUES (:first_name, :last_name, :email, :phone_number, 'pending')
+    """), {
+        "first_name": payload.first_name,
+        "last_name": payload.last_name,
+        "email": payload.email,
+        "phone_number": payload.phone_number
+    })
+    db.commit()
+    new_student_id = db.execute(text("SELECT LAST_INSERT_ID()")).scalar()
+
+    # 2. Create the application record
+    db.execute(text("""
+        INSERT INTO applications (student_id, application_type, grade_level, status)
+        VALUES (:student_id, :application_type, :grade_level, 'pending')
+    """), {
+        "student_id": new_student_id,
+        "application_type": payload.application_type,
+        "grade_level": payload.grade_level
+    })
+    db.commit()
+    new_app_id = db.execute(text("SELECT LAST_INSERT_ID()")).scalar()
+
+    # 3. Build the full requirements checklist for this application type
+    #    ('both' requirements always included, plus type-specific ones)
+    reqs = db.execute(text(
+        "SELECT id FROM requirements WHERE application_type = 'both' OR application_type = :atype"
+    ), {"atype": payload.application_type}).fetchall()
+
+    declared_set = set(payload.requirement_ids_declared)
+    for row in reqs:
+        rid = row[0]
+        db.execute(text("""
+            INSERT INTO application_requirements
+                (application_id, requirement_id, declared_by_student, verified_by_registrar)
+            VALUES (:aid, :rid, :declared, 0)
+        """), {
+            "aid": new_app_id,
+            "rid": rid,
+            "declared": 1 if rid in declared_set else 0
+        })
+    db.commit()
+
+    return {"message": "Application submitted", "application_id": new_app_id, "student_id": new_student_id}
+
+
+# ---- REGISTRAR: list applications (filter by status / type, search by name) ----
+@app.get("/applications")
+def list_applications(
+    status: Optional[str] = None,
+    application_type: Optional[str] = None,
+    search: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    query = """
+        SELECT a.id, a.application_type, a.grade_level, a.status,
+               a.submitted_at, a.reviewed_at,
+               s.id AS student_id, s.first_name, s.last_name, s.email, s.phone_number
+        FROM applications a
+        JOIN students s ON a.student_id = s.id
+        WHERE 1=1
+    """
+    params = {}
+    if status:
+        query += " AND a.status = :status"
+        params["status"] = status
+    if application_type:
+        query += " AND a.application_type = :application_type"
+        params["application_type"] = application_type
+    if search:
+        query += " AND (s.first_name LIKE :search OR s.last_name LIKE :search)"
+        params["search"] = f"%{search}%"
+    query += " ORDER BY a.submitted_at DESC"
+
+    result = db.execute(text(query), params)
+    rows = []
+    for row in result:
+        r = dict(row._mapping)
+        if r.get("submitted_at"):
+            r["submitted_at"] = str(r["submitted_at"])
+        if r.get("reviewed_at"):
+            r["reviewed_at"] = str(r["reviewed_at"])
+        rows.append(r)
+    return rows
+
+
+# ---- REGISTRAR: full detail for one application, including checklist ----
+@app.get("/applications/{application_id}")
+def get_application(application_id: int, db: Session = Depends(get_db)):
+    app_row = db.execute(text("""
+        SELECT a.id, a.application_type, a.grade_level, a.status,
+               a.submitted_at, a.reviewed_at, a.reviewed_by,
+               s.id AS student_id, s.first_name, s.last_name, s.email, s.phone_number
+        FROM applications a
+        JOIN students s ON a.student_id = s.id
+        WHERE a.id = :id
+    """), {"id": application_id}).fetchone()
+
+    if not app_row:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    application = dict(app_row._mapping)
+    if application.get("submitted_at"):
+        application["submitted_at"] = str(application["submitted_at"])
+    if application.get("reviewed_at"):
+        application["reviewed_at"] = str(application["reviewed_at"])
+
+    checklist = db.execute(text("""
+        SELECT ar.id, ar.requirement_id, r.name, ar.declared_by_student,
+               ar.verified_by_registrar, ar.verified_at
+        FROM application_requirements ar
+        JOIN requirements r ON ar.requirement_id = r.id
+        WHERE ar.application_id = :id
+        ORDER BY r.id
+    """), {"id": application_id}).fetchall()
+
+    application["requirements"] = []
+    for row in checklist:
+        item = dict(row._mapping)
+        if item.get("verified_at"):
+            item["verified_at"] = str(item["verified_at"])
+        application["requirements"].append(item)
+
+    return application
+
+
+# ---- REGISTRAR: approve an application (sends email #1) ----
+@app.put("/applications/{application_id}/approve")
+def approve_application(application_id: int, db: Session = Depends(get_db)):
+    row = db.execute(text("""
+        SELECT a.grade_level, a.application_type, s.email, s.first_name, s.last_name
+        FROM applications a JOIN students s ON a.student_id = s.id
+        WHERE a.id = :id
+    """), {"id": application_id}).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    db.execute(text("""
+        UPDATE applications
+        SET status = 'initially_approved', reviewed_at = NOW()
+        WHERE id = :id
+    """), {"id": application_id})
+    db.execute(text("""
+        UPDATE students s
+        JOIN applications a ON a.student_id = s.id
+        SET s.enrollment_status = 'initially_approved'
+        WHERE a.id = :id
+    """), {"id": application_id})
+    db.commit()
+
+    data = dict(row._mapping)
+    full_name = f"{data['first_name']} {data['last_name']}"
+    subject = "Enrollment Application Approved — TCTAR Integrated Farm School"
+    body = (
+        f"Kumusta {full_name},\n\n"
+        f"Magandang balita! Na-approve na ang inyong enrollment application "
+        f"({data['grade_level']}) sa Tiu Cho Teg - Ana Ros Foundation Integrated Farm School.\n\n"
+        f"Sundan ang susunod na hakbang:\n"
+        f"1. Pumunta sa paaralan sa Iloilo Radial By-Pass Rd 4, Lanit, Jaro, Iloilo City.\n"
+        f"2. Dalhin ang lahat ng orihinal na kopya ng mga requirements na inyong idineklara "
+        f"sa online enrollment form.\n"
+        f"3. Hihintayin ng registrar ang inyong mga dokumento para sa huling pagpapatunay.\n\n"
+        f"Para sa mga katanungan, maaari kayong tumawag sa +63 33 337 8522.\n\n"
+        f"Salamat po,\nTCTAR Integrated Farm School"
+    )
+    send_email(data["email"], subject, body)
+
+    return {"message": "Application approved, email sent"}
+
+
+# ---- REGISTRAR: reject an application ----
+@app.put("/applications/{application_id}/reject")
+def reject_application(application_id: int, db: Session = Depends(get_db)):
+    row = db.execute(text("""
+        SELECT s.email, s.first_name, s.last_name
+        FROM applications a JOIN students s ON a.student_id = s.id
+        WHERE a.id = :id
+    """), {"id": application_id}).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    db.execute(text("""
+        UPDATE applications
+        SET status = 'rejected', reviewed_at = NOW()
+        WHERE id = :id
+    """), {"id": application_id})
+    db.execute(text("""
+        UPDATE students s
+        JOIN applications a ON a.student_id = s.id
+        SET s.enrollment_status = 'rejected'
+        WHERE a.id = :id
+    """), {"id": application_id})
+    db.commit()
+
+    data = dict(row._mapping)
+    full_name = f"{data['first_name']} {data['last_name']}"
+    subject = "Enrollment Application Update — TCTAR Integrated Farm School"
+    body = (
+        f"Kumusta {full_name},\n\n"
+        f"Sa kasamaang palad, hindi po naaprubahan ang inyong enrollment application "
+        f"sa ngayon. Para sa karagdagang impormasyon o tulong, maaari po kayong "
+        f"tumawag sa amin sa +63 33 337 8522 o mag-email sa 500191@deped.gov.ph.\n\n"
+        f"Salamat po,\nTCTAR Integrated Farm School"
+    )
+    send_email(data["email"], subject, body)
+
+    return {"message": "Application rejected, email sent"}
+
+
+# ---- REGISTRAR: toggle a single requirement as physically verified ----
+@app.put("/application_requirements/{item_id}/verify")
+def verify_requirement(item_id: int, verified: bool = True, db: Session = Depends(get_db)):
+    result = db.execute(text("""
+        UPDATE application_requirements
+        SET verified_by_registrar = :verified,
+            verified_at = CASE WHEN :verified = 1 THEN NOW() ELSE NULL END
+        WHERE id = :id
+    """), {"verified": 1 if verified else 0, "id": item_id})
+    db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Checklist item not found")
+    return {"message": "Requirement updated"}
+
+
+# ---- REGISTRAR: finalize enrollment once all requirements are verified (sends email #2) ----
+@app.put("/applications/{application_id}/complete")
+def complete_application(application_id: int, db: Session = Depends(get_db)):
+    row = db.execute(text("""
+        SELECT a.student_id, s.email, s.first_name, s.last_name
+        FROM applications a JOIN students s ON a.student_id = s.id
+        WHERE a.id = :id
+    """), {"id": application_id}).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    unverified_count = db.execute(text("""
+        SELECT COUNT(*) FROM application_requirements
+        WHERE application_id = :id AND verified_by_registrar = 0
+    """), {"id": application_id}).scalar()
+
+    if unverified_count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{unverified_count} requirement(s) still unverified. Check them off first."
+        )
+
+    data = dict(row._mapping)
+
+    db.execute(text("""
+        UPDATE applications SET status = 'officially_enrolled' WHERE id = :id
+    """), {"id": application_id})
+    db.execute(text("""
+        UPDATE students SET enrollment_status = 'officially_enrolled' WHERE id = :sid
+    """), {"sid": data["student_id"]})
+    db.commit()
+
+    full_name = f"{data['first_name']} {data['last_name']}"
+    subject = "Opisyal na Naka-enroll! — TCTAR Integrated Farm School"
+    body = (
+        f"Kumusta {full_name},\n\n"
+        f"Nakumpirma na ang lahat ng inyong requirements. Kayo po ay opisyal na "
+        f"naka-enroll na sa Tiu Cho Teg - Ana Ros Foundation Integrated Farm School!\n\n"
+        f"Maligayang pagdating sa aming paaralan. Susundan namin ng impormasyon "
+        f"tungkol sa first day ng klase at seksyon.\n\n"
+        f"Salamat po,\nTCTAR Integrated Farm School"
+    )
+    send_email(data["email"], subject, body)
+
+    return {"message": "Application marked officially enrolled, email sent"}
