@@ -413,3 +413,49 @@ def update_video(payload: VideoUpdate, db: Session = Depends(get_db)):
     ), {"url": payload.url, "description": payload.description})
     db.commit()
     return {"message": "Video updated", "url": payload.url}
+
+
+class TestimonialCreate(BaseModel):
+    name: str
+    role: str
+    quote: str
+    rating: Optional[int] = 5
+
+MAX_TESTIMONIALS = 5
+
+@app.get("/website/testimonials")
+def get_testimonials(db: Session = Depends(get_db)):
+    result = db.execute(text(
+        "SELECT id, name, role, quote, rating, created_at "
+        "FROM website_testimonials ORDER BY created_at ASC"
+    ))
+    rows = []
+    for row in result:
+        r = dict(row._mapping)
+        if r.get("created_at"):
+            r["created_at"] = str(r["created_at"])
+        rows.append(r)
+    return rows
+
+@app.post("/website/testimonials")
+def create_testimonial(payload: TestimonialCreate, db: Session = Depends(get_db)):
+    count = db.execute(text("SELECT COUNT(*) FROM website_testimonials")).scalar()
+    if count >= MAX_TESTIMONIALS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Maximum of {MAX_TESTIMONIALS} testimonials reached. Delete one first."
+        )
+    rating = payload.rating if payload.rating and 1 <= payload.rating <= 5 else 5
+    db.execute(text(
+        "INSERT INTO website_testimonials (name, role, quote, rating) "
+        "VALUES (:name, :role, :quote, :rating)"
+    ), {"name": payload.name, "role": payload.role, "quote": payload.quote, "rating": rating})
+    db.commit()
+    new_id = db.execute(text("SELECT LAST_INSERT_ID()")).scalar()
+    return {"message": "Testimonial created", "id": new_id}
+
+@app.delete("/website/testimonials/{testimonial_id}")
+def delete_testimonial(testimonial_id: int, db: Session = Depends(get_db)):
+    db.execute(text("DELETE FROM website_testimonials WHERE id = :id"), {"id": testimonial_id})
+    db.commit()
+    return {"message": "Testimonial deleted"}
