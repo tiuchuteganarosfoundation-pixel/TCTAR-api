@@ -421,13 +421,24 @@ class TestimonialCreate(BaseModel):
     quote: str
     rating: Optional[int] = 5
 
+class TestimonialSubmit(BaseModel):
+    name: str
+    role: str
+    quote: str
+    rating: Optional[int] = 5
+
 MAX_TESTIMONIALS = 5
 
+def _clean_rating(rating: Optional[int]) -> int:
+    return rating if rating and 1 <= rating <= 5 else 5
+
+# ---- PUBLIC: homepage only ever sees approved testimonials ----
 @app.get("/website/testimonials")
 def get_testimonials(db: Session = Depends(get_db)):
     result = db.execute(text(
         "SELECT id, name, role, quote, rating, created_at "
-        "FROM website_testimonials ORDER BY created_at ASC"
+        "FROM website_testimonials WHERE status = 'approved' "
+        "ORDER BY created_at ASC"
     ))
     rows = []
     for row in result:
@@ -437,23 +448,75 @@ def get_testimonials(db: Session = Depends(get_db)):
         rows.append(r)
     return rows
 
+# ---- ADMIN: view the pending queue ----
+@app.get("/website/testimonials/pending")
+def get_pending_testimonials(db: Session = Depends(get_db)):
+    result = db.execute(text(
+        "SELECT id, name, role, quote, rating, created_at "
+        "FROM website_testimonials WHERE status = 'pending' "
+        "ORDER BY created_at ASC"
+    ))
+    rows = []
+    for row in result:
+        r = dict(row._mapping)
+        if r.get("created_at"):
+            r["created_at"] = str(r["created_at"])
+        rows.append(r)
+    return rows
+
+# ---- PUBLIC: submission form posts here, always lands as pending ----
+@app.post("/website/testimonials/submit")
+def submit_testimonial(payload: TestimonialSubmit, db: Session = Depends(get_db)):
+    rating = _clean_rating(payload.rating)
+    db.execute(text(
+        "INSERT INTO website_testimonials (name, role, quote, rating, status) "
+        "VALUES (:name, :role, :quote, :rating, 'pending')"
+    ), {"name": payload.name, "role": payload.role, "quote": payload.quote, "rating": rating})
+    db.commit()
+    new_id = db.execute(text("SELECT LAST_INSERT_ID()")).scalar()
+    return {"message": "Testimonial submitted for review", "id": new_id}
+
+# ---- ADMIN: add a testimonial directly, auto-approved (staff-entered) ----
 @app.post("/website/testimonials")
 def create_testimonial(payload: TestimonialCreate, db: Session = Depends(get_db)):
-    count = db.execute(text("SELECT COUNT(*) FROM website_testimonials")).scalar()
+    count = db.execute(
+        text("SELECT COUNT(*) FROM website_testimonials WHERE status = 'approved'")
+    ).scalar()
     if count >= MAX_TESTIMONIALS:
         raise HTTPException(
             status_code=400,
-            detail=f"Maximum of {MAX_TESTIMONIALS} testimonials reached. Delete one first."
+            detail=f"Maximum of {MAX_TESTIMONIALS} approved testimonials reached. Remove one first."
         )
-    rating = payload.rating if payload.rating and 1 <= payload.rating <= 5 else 5
+    rating = _clean_rating(payload.rating)
     db.execute(text(
-        "INSERT INTO website_testimonials (name, role, quote, rating) "
-        "VALUES (:name, :role, :quote, :rating)"
+        "INSERT INTO website_testimonials (name, role, quote, rating, status) "
+        "VALUES (:name, :role, :quote, :rating, 'approved')"
     ), {"name": payload.name, "role": payload.role, "quote": payload.quote, "rating": rating})
     db.commit()
     new_id = db.execute(text("SELECT LAST_INSERT_ID()")).scalar()
     return {"message": "Testimonial created", "id": new_id}
 
+# ---- ADMIN: approve a pending submission ----
+@app.put("/website/testimonials/{testimonial_id}/approve")
+def approve_testimonial(testimonial_id: int, db: Session = Depends(get_db)):
+    count = db.execute(
+        text("SELECT COUNT(*) FROM website_testimonials WHERE status = 'approved'")
+    ).scalar()
+    if count >= MAX_TESTIMONIALS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Maximum of {MAX_TESTIMONIALS} approved testimonials reached. Remove one first."
+        )
+    result = db.execute(
+        text("UPDATE website_testimonials SET status = 'approved' WHERE id = :id"),
+        {"id": testimonial_id}
+    )
+    db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Testimonial not found")
+    return {"message": "Testimonial approved"}
+
+# ---- ADMIN: delete/reject any testimonial (pending or approved) ----
 @app.delete("/website/testimonials/{testimonial_id}")
 def delete_testimonial(testimonial_id: int, db: Session = Depends(get_db)):
     db.execute(text("DELETE FROM website_testimonials WHERE id = :id"), {"id": testimonial_id})
