@@ -582,7 +582,7 @@ def create_application(payload: ApplicationCreate, db: Session = Depends(get_db)
         raise HTTPException(status_code=400, detail="application_type must be 'regular' or 'als'")
 
     # 1. Create the student record
-    db.execute(text("""
+    student_result = db.execute(text("""
         INSERT INTO students (first_name, last_name, email, phone_number, enrollment_status)
         VALUES (:first_name, :last_name, :email, :phone_number, 'pending')
     """), {
@@ -591,11 +591,11 @@ def create_application(payload: ApplicationCreate, db: Session = Depends(get_db)
         "email": payload.email,
         "phone_number": payload.phone_number
     })
+    new_student_id = student_result.lastrowid
     db.commit()
-    new_student_id = db.execute(text("SELECT LAST_INSERT_ID()")).scalar()
 
     # 2. Create the application record
-    db.execute(text("""
+    application_result = db.execute(text("""
         INSERT INTO applications (student_id, application_type, grade_level, status)
         VALUES (:student_id, :application_type, :grade_level, 'pending')
     """), {
@@ -603,8 +603,8 @@ def create_application(payload: ApplicationCreate, db: Session = Depends(get_db)
         "application_type": payload.application_type,
         "grade_level": payload.grade_level
     })
+    new_app_id = application_result.lastrowid
     db.commit()
-    new_app_id = db.execute(text("SELECT LAST_INSERT_ID()")).scalar()
 
     # 3. Build the full requirements checklist for this application type
     #    ('both' requirements always included, plus type-specific ones)
