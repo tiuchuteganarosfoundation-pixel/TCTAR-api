@@ -2,8 +2,9 @@ from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 import os
+import json
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -575,6 +576,115 @@ class ApplicationCreate(BaseModel):
     grade_level: str
     requirement_ids_declared: List[int] = []
 
+    # School year this application is for. If the form doesn't send one,
+    # we fall back to whichever school year is marked is_current=1.
+    school_year_id: Optional[int] = None
+
+    # ---- Shared identity / demographic fields ----
+    lrn: Optional[str] = None
+    middle_name: Optional[str] = None
+    ext_name: Optional[str] = None
+    birthdate: Optional[str] = None
+    age: Optional[str] = None
+    sex: Optional[str] = None
+    religion: Optional[str] = None
+    mother_tongue: Optional[str] = None
+    ip_group: Optional[str] = None
+    signer_name: Optional[str] = None
+    sign_date: Optional[str] = None
+
+    # ---- Address ----
+    current_street: Optional[str] = None
+    current_barangay: Optional[str] = None
+    current_municipality: Optional[str] = None
+    current_province: Optional[str] = None
+    current_zip: Optional[str] = None
+    permanent_same_as_current: Optional[bool] = None
+    permanent_street: Optional[str] = None
+    permanent_barangay: Optional[str] = None
+    permanent_municipality: Optional[str] = None
+    permanent_province: Optional[str] = None
+    permanent_zip: Optional[str] = None
+
+    # ---- Parents / guardian ----
+    father_last_name: Optional[str] = None
+    father_first_name: Optional[str] = None
+    father_contact: Optional[str] = None
+    father_occupation: Optional[str] = None
+    mother_last_name: Optional[str] = None
+    mother_first_name: Optional[str] = None
+    mother_contact: Optional[str] = None
+    mother_occupation: Optional[str] = None
+    guardian_last_name: Optional[str] = None
+    guardian_first_name: Optional[str] = None
+    guardian_contact: Optional[str] = None
+
+    # ---- Special classifications ----
+    ip_member: Optional[str] = None
+    four_ps: Optional[str] = None
+    four_ps_id: Optional[str] = None
+    special_needs: Optional[str] = None
+    disability: Optional[str] = None
+    pwd_id: Optional[str] = None
+    pwd_id_number: Optional[str] = None
+
+    # ---- Regular-form-specific ----
+    graded_status: Optional[str] = None
+    psa_no: Optional[str] = None
+    place_of_birth: Optional[str] = None
+    returning_learner: Optional[str] = None
+    last_school_year: Optional[str] = None
+    last_grade: Optional[str] = None
+    last_school: Optional[str] = None
+    trimester: Optional[str] = None
+    shs_track: Optional[str] = None
+    shs_strand: Optional[str] = None
+    modality: Optional[str] = None
+
+    # ---- ALS-form-specific ----
+    civil_status: Optional[str] = None
+    pwd: Optional[str] = None
+    dropout_reason: Optional[str] = None
+    dropout_other: Optional[str] = None
+    als_before: Optional[str] = None
+    als_program_name: Optional[str] = None
+    als_year_attended: Optional[str] = None
+    als_completed: Optional[str] = None
+    als_not_completed_reason: Optional[str] = None
+    distance_km: Optional[str] = None
+    travel_hours: Optional[str] = None
+    travel_mins: Optional[str] = None
+    travel_mode: Optional[str] = None
+    travel_other: Optional[str] = None
+    als_availability_schedule: Optional[Dict[str, Any]] = None
+
+
+# Every application-detail column beyond the original 5 basics, used to
+# build the INSERT and the SELECT in one place instead of duplicating the
+# list - add a new field here and to ApplicationCreate above, and both the
+# save and the read-back pick it up automatically.
+APPLICATION_DETAIL_FIELDS = [
+    "lrn", "middle_name", "ext_name", "birthdate", "age", "sex", "religion",
+    "mother_tongue", "ip_group", "signer_name", "sign_date",
+    "current_street", "current_barangay", "current_municipality",
+    "current_province", "current_zip", "permanent_same_as_current",
+    "permanent_street", "permanent_barangay", "permanent_municipality",
+    "permanent_province", "permanent_zip",
+    "father_last_name", "father_first_name", "father_contact", "father_occupation",
+    "mother_last_name", "mother_first_name", "mother_contact", "mother_occupation",
+    "guardian_last_name", "guardian_first_name", "guardian_contact",
+    "ip_member", "four_ps", "four_ps_id", "special_needs", "disability",
+    "pwd_id", "pwd_id_number",
+    "graded_status", "psa_no", "place_of_birth", "returning_learner",
+    "last_school_year", "last_grade", "last_school", "trimester",
+    "shs_track", "shs_strand", "modality",
+    "civil_status", "pwd", "dropout_reason", "dropout_other", "als_before",
+    "als_program_name", "als_year_attended", "als_completed",
+    "als_not_completed_reason", "distance_km", "travel_hours", "travel_mins",
+    "travel_mode", "travel_other",
+]
+
+
 # ---- PUBLIC: enrollment forms submit here ----
 @app.post("/applications")
 def create_application(payload: ApplicationCreate, db: Session = Depends(get_db)):
@@ -594,15 +704,40 @@ def create_application(payload: ApplicationCreate, db: Session = Depends(get_db)
     new_student_id = student_result.lastrowid
     db.commit()
 
-    # 2. Create the application record
-    application_result = db.execute(text("""
-        INSERT INTO applications (student_id, application_type, grade_level, status)
-        VALUES (:student_id, :application_type, :grade_level, 'pending')
-    """), {
+    # Fall back to whichever school year is marked current if the form
+    # didn't specify one.
+    school_year_id = payload.school_year_id
+    if school_year_id is None:
+        current_year = db.execute(text(
+            "SELECT id FROM school_years WHERE is_current = 1 LIMIT 1"
+        )).fetchone()
+        school_year_id = current_year[0] if current_year else None
+
+    # 2. Create the application record - basic fields + every detail field
+    detail_values = {f: getattr(payload, f) for f in APPLICATION_DETAIL_FIELDS}
+    # als_availability_schedule is JSON, needs serializing separately
+    detail_values["als_availability_schedule"] = (
+        json.dumps(payload.als_availability_schedule) if payload.als_availability_schedule else None
+    )
+
+    columns = ["student_id", "application_type", "grade_level", "school_year_id", "status"] + \
+              APPLICATION_DETAIL_FIELDS + ["als_availability_schedule"]
+    placeholders = ", ".join(f":{c}" for c in columns)
+    column_list = ", ".join(columns)
+
+    params = {
         "student_id": new_student_id,
         "application_type": payload.application_type,
-        "grade_level": payload.grade_level
-    })
+        "grade_level": payload.grade_level,
+        "school_year_id": school_year_id,
+        "status": "pending",
+        **detail_values,
+    }
+
+    application_result = db.execute(
+        text(f"INSERT INTO applications ({column_list}) VALUES ({placeholders})"),
+        params
+    )
     new_app_id = application_result.lastrowid
     db.commit()
 
@@ -627,6 +762,35 @@ def create_application(payload: ApplicationCreate, db: Session = Depends(get_db)
     db.commit()
 
     return {"message": "Application submitted", "application_id": new_app_id, "student_id": new_student_id}
+
+
+# ---- School years ----
+@app.get("/school-years")
+def list_school_years(db: Session = Depends(get_db)):
+    rows = db.execute(text(
+        "SELECT id, label, is_current FROM school_years ORDER BY label DESC"
+    )).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+@app.put("/school-years/{school_year_id}/set-current")
+def set_current_school_year(school_year_id: int, db: Session = Depends(get_db)):
+    exists = db.execute(text("SELECT id FROM school_years WHERE id = :id"),
+                         {"id": school_year_id}).fetchone()
+    if not exists:
+        raise HTTPException(status_code=404, detail="School year not found")
+    db.execute(text("UPDATE school_years SET is_current = 0"))
+    db.execute(text("UPDATE school_years SET is_current = 1 WHERE id = :id"), {"id": school_year_id})
+    db.commit()
+    return {"message": "Current school year updated"}
+
+
+@app.post("/school-years")
+def create_school_year(label: str, db: Session = Depends(get_db)):
+    result = db.execute(text("INSERT INTO school_years (label, is_current) VALUES (:label, 0)"),
+                         {"label": label})
+    db.commit()
+    return {"id": result.lastrowid, "label": label}
 
 
 # ---- REGISTRAR: list applications (filter by status / type, search by name) ----
@@ -672,12 +836,17 @@ def list_applications(
 # ---- REGISTRAR: full detail for one application, including checklist ----
 @app.get("/applications/{application_id}")
 def get_application(application_id: int, db: Session = Depends(get_db)):
-    app_row = db.execute(text("""
+    detail_columns = ", ".join(f"a.{f}" for f in APPLICATION_DETAIL_FIELDS)
+    app_row = db.execute(text(f"""
         SELECT a.id, a.application_type, a.grade_level, a.status,
+               a.school_year_id, sy.label AS school_year_label,
+               {detail_columns},
+               a.als_availability_schedule,
                a.submitted_at, a.reviewed_at, a.reviewed_by,
                s.id AS student_id, s.first_name, s.last_name, s.email, s.phone_number
         FROM applications a
         JOIN students s ON a.student_id = s.id
+        LEFT JOIN school_years sy ON a.school_year_id = sy.id
         WHERE a.id = :id
     """), {"id": application_id}).fetchone()
 
@@ -685,10 +854,20 @@ def get_application(application_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Application not found")
 
     application = dict(app_row._mapping)
-    if application.get("submitted_at"):
-        application["submitted_at"] = str(application["submitted_at"])
-    if application.get("reviewed_at"):
-        application["reviewed_at"] = str(application["reviewed_at"])
+    for date_field in ("submitted_at", "reviewed_at", "birthdate", "sign_date"):
+        if application.get(date_field):
+            application[date_field] = str(application[date_field])
+
+    # als_availability_schedule comes back from MySQL as a JSON string (or
+    # None/dict depending on driver version) - normalize it to a plain dict.
+    raw_schedule = application.get("als_availability_schedule")
+    if isinstance(raw_schedule, str):
+        try:
+            application["als_availability_schedule"] = json.loads(raw_schedule)
+        except (ValueError, TypeError):
+            application["als_availability_schedule"] = None
+    elif not isinstance(raw_schedule, dict):
+        application["als_availability_schedule"] = None
 
     checklist = db.execute(text("""
         SELECT ar.id, ar.requirement_id, r.name, ar.declared_by_student,
