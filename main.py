@@ -361,6 +361,199 @@ def create_assignment(payload: AssignmentCreate, db: Session = Depends(get_db)):
     new_id = db.execute(text("SELECT LAST_INSERT_ID()")).scalar()
     return {"message": "Assignment created", "id": new_id}
 
+
+# ============================================================
+# LOGIN
+# ============================================================
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/login")
+def login(payload: LoginRequest, db: Session = Depends(get_db)):
+    # NOTE: password_hash is currently stored as plaintext (same TODO
+    # flagged at account-creation time in create_teacher/complete_application)
+    # - this is a direct equality check as a placeholder, not real auth.
+    # Replace with a real hash comparison (passlib/bcrypt) before this
+    # handles real credentials at scale.
+    user = db.execute(text("""
+        SELECT id, username, role, status FROM users
+        WHERE username = :username AND password_hash = :password
+    """), {"username": payload.username, "password": payload.password}).fetchone()
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    user_data = dict(user._mapping)
+    if user_data["status"] != "active":
+        raise HTTPException(status_code=403, detail="This account is not active")
+
+    if user_data["role"] == "teacher":
+        teacher = db.execute(text("""
+            SELECT id, first_name, last_name, email, phone_number, employee_id,
+                   department_id, must_change_password
+            FROM teachers WHERE user_id = :uid
+        """), {"uid": user_data["id"]}).fetchone()
+        if not teacher:
+            raise HTTPException(status_code=404, detail="Teacher record not found for this login")
+        teacher_data = dict(teacher._mapping)
+        return {
+            "user_id": user_data["id"],
+            "username": user_data["username"],
+            "role": "teacher",
+            "teacher_id": teacher_data["id"],
+            "first_name": teacher_data["first_name"],
+            "last_name": teacher_data["last_name"],
+            "email": teacher_data["email"],
+            "employee_id": teacher_data["employee_id"],
+            "must_change_password": bool(teacher_data["must_change_password"]),
+        }
+
+    return {
+        "user_id": user_data["id"],
+        "username": user_data["username"],
+        "role": user_data["role"],
+    }
+
+
+@app.put("/users/{user_id}/change-password")
+def change_password(user_id: int, new_password: str, db: Session = Depends(get_db)):
+    exists = db.execute(text("SELECT id FROM users WHERE id = :id"), {"id": user_id}).fetchone()
+    if not exists:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    db.execute(text(
+        "UPDATE users SET password_hash = :pw WHERE id = :id"
+    ), {"pw": new_password, "id": user_id})
+    db.execute(text(
+        "UPDATE teachers SET must_change_password = FALSE WHERE user_id = :id"
+    ), {"id": user_id})
+    db.commit()
+    return {"message": "Password updated"}
+
+
+# ============================================================
+# TEACHER-SCOPED VIEWS
+# ============================================================
+@app.get("/teachers/{teacher_id}/assignments")
+def get_teacher_assignments(teacher_id: int, db: Session = Depends(get_db)):
+    rows = db.execute(text("""
+        SELECT sst.id, sst.section_id, sst.subject_id,
+               sec.grade_level, sec.section_name, sub.name AS subject_name,
+               sst.schedule_day, sst.start_time, sst.end_time
+        FROM section_subject_teacher sst
+        JOIN sections sec ON sst.section_id = sec.id
+        JOIN subjects sub ON sst.subject_id = sub.id
+        WHERE sst.teacher_id = :tid
+        ORDER BY sec.grade_level, sec.section_name, sst.schedule_day, sst.start_time
+    """), {"tid": teacher_id}).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+@app.get("/sections/{section_id}/students")
+def get_section_students(section_id: int, db: Session = Depends(get_db)):
+    rows = db.execute(text("""
+        SELECT id, student_id_number, first_name, last_name, email, phone_number
+        FROM students
+        WHERE section_id = :sid
+        ORDER BY last_name, first_name
+    """), {"sid": section_id}).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+# ============================================================
+# GRADES
+# ============================================================
+class GradeCreate(BaseModel):
+    student_id: int
+    section_subject_teacher_id: int
+    assessment_type: str      # e.g. 'Quiz', 'Project', 'Activity', 'Exam'
+    title: str
+    score: Optional[float] = None
+    max_score: float
+    status: str = "assigned"  # 'assigned', 'submitted', 'graded', 'missing'
+    due_date: Optional[str] = None
+
+
+class GradeUpdate(BaseModel):
+    title: Optional[str] = None
+    score: Optional[float] = None
+    max_score: Optional[float] = None
+    status: Optional[str] = None
+    due_date: Optional[str] = None
+
+
+@app.get("/grades")
+def list_grades(section_subject_teacher_id: int, db: Session = Depends(get_db)):
+    rows = db.execute(text("""
+        SELECT g.id, g.student_id, s.first_name, s.last_name, s.student_id_number,
+               g.assessment_type, g.title, g.score, g.max_score, g.status,
+               g.due_date, g.synced
+        FROM grades g
+        JOIN students s ON g.student_id = s.id
+        WHERE g.section_subject_teacher_id = :sstid
+        ORDER BY g.due_date DESC, s.last_name, s.first_name
+    """), {"sstid": section_subject_teacher_id}).fetchall()
+    result = []
+    for r in rows:
+        item = dict(r._mapping)
+        if item.get("due_date"):
+            item["due_date"] = str(item["due_date"])
+        result.append(item)
+    return result
+
+
+@app.post("/grades")
+def create_grade(payload: GradeCreate, db: Session = Depends(get_db)):
+    result = db.execute(text("""
+        INSERT INTO grades
+            (student_id, section_subject_teacher_id, assessment_type, title,
+             score, max_score, status, due_date, synced)
+        VALUES
+            (:student_id, :sstid, :assessment_type, :title,
+             :score, :max_score, :status, :due_date, 1)
+    """), {
+        "student_id": payload.student_id,
+        "sstid": payload.section_subject_teacher_id,
+        "assessment_type": payload.assessment_type,
+        "title": payload.title,
+        "score": payload.score,
+        "max_score": payload.max_score,
+        "status": payload.status,
+        "due_date": payload.due_date,
+    })
+    db.commit()
+    return {"message": "Grade created", "id": result.lastrowid}
+
+
+@app.put("/grades/{grade_id}")
+def update_grade(grade_id: int, payload: GradeUpdate, db: Session = Depends(get_db)):
+    existing = db.execute(text("SELECT id FROM grades WHERE id = :id"), {"id": grade_id}).fetchone()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Grade not found")
+
+    updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not updates:
+        return {"message": "Nothing to update"}
+
+    set_clause = ", ".join(f"{k} = :{k}" for k in updates)
+    updates["id"] = grade_id
+    db.execute(text(f"UPDATE grades SET {set_clause} WHERE id = :id"), updates)
+    db.commit()
+    return {"message": "Grade updated"}
+
+
+@app.delete("/grades/{grade_id}")
+def delete_grade(grade_id: int, db: Session = Depends(get_db)):
+    existing = db.execute(text("SELECT id FROM grades WHERE id = :id"), {"id": grade_id}).fetchone()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Grade not found")
+    db.execute(text("DELETE FROM grades WHERE id = :id"), {"id": grade_id})
+    db.commit()
+    return {"message": "Grade deleted"}
+
+
 # ============================================================
 # WEBSITE CONTENT ENDPOINTS
 # ============================================================
