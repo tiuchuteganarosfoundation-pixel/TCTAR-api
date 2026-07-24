@@ -6,6 +6,7 @@ from typing import Optional, List, Dict, Any
 import os
 import json
 import smtplib
+from datetime import date
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -277,7 +278,7 @@ def create_teacher(payload: TeacherCreate, db: Session = Depends(get_db)):
     # Create the login (users table). Employee ID is both username and
     # initial password - must_change_password flags that it should be
     # changed on first login.
-    db.execute(
+    user_result = db.execute(
         text("""
             INSERT INTO users (username, password_hash, role, status)
             VALUES (:username, :password_hash, 'teacher', 'active')
@@ -288,11 +289,11 @@ def create_teacher(payload: TeacherCreate, db: Session = Depends(get_db)):
         # with a real hash (e.g. using passlib/bcrypt) - flagged here
         # so it isn't forgotten.
     )
+    new_user_id = user_result.lastrowid
     db.commit()
-    new_user_id = db.execute(text("SELECT LAST_INSERT_ID()")).scalar()
 
     # Create the teacher record, linked to that login
-    db.execute(
+    teacher_result = db.execute(
         text("""
             INSERT INTO teachers
                 (user_id, first_name, last_name, phone_number, email,
@@ -312,8 +313,8 @@ def create_teacher(payload: TeacherCreate, db: Session = Depends(get_db)):
             "department_id": payload.department_id
         }
     )
+    new_teacher_id = teacher_result.lastrowid
     db.commit()
-    new_teacher_id = db.execute(text("SELECT LAST_INSERT_ID()")).scalar()
 
     return {
         "message": "Teacher registered",
@@ -843,7 +844,8 @@ def get_application(application_id: int, db: Session = Depends(get_db)):
                {detail_columns},
                a.als_availability_schedule,
                a.submitted_at, a.reviewed_at, a.reviewed_by,
-               s.id AS student_id, s.first_name, s.last_name, s.email, s.phone_number
+               s.id AS student_id, s.first_name, s.last_name, s.email, s.phone_number,
+               s.student_id_number
         FROM applications a
         JOIN students s ON a.student_id = s.id
         LEFT JOIN school_years sy ON a.school_year_id = sy.id
@@ -988,9 +990,10 @@ def verify_requirement(item_id: int, verified: bool = True, db: Session = Depend
 
 # ---- REGISTRAR: finalize enrollment once all requirements are verified (sends email #2) ----
 @app.put("/applications/{application_id}/complete")
-def complete_application(application_id: int, db: Session = Depends(get_db)):
+def complete_application(application_id: int, section_id: Optional[int] = None, db: Session = Depends(get_db)):
     row = db.execute(text("""
-        SELECT a.student_id, s.email, s.first_name, s.last_name
+        SELECT a.student_id, a.school_year_id, s.email, s.first_name, s.last_name,
+               s.user_id, s.student_id_number
         FROM applications a JOIN students s ON a.student_id = s.id
         WHERE a.id = :id
     """), {"id": application_id}).fetchone()
@@ -1009,6 +1012,43 @@ def complete_application(application_id: int, db: Session = Depends(get_db)):
         )
 
     data = dict(row._mapping)
+
+    # Create the student's login account now, if one doesn't already exist.
+    # Mirrors the pattern already used for teacher accounts above: username
+    # and initial password are both the generated ID (flagged there as a
+    # TODO to replace with a real hash - same TODO applies here).
+    if not data["user_id"]:
+        sy_row = db.execute(text(
+            "SELECT label FROM school_years WHERE id = :id"
+        ), {"id": data["school_year_id"]}).fetchone()
+        sy_label = sy_row[0] if sy_row else None
+        sy_prefix = (sy_label[:4] if sy_label else date.today().strftime("%Y"))
+
+        count_row = db.execute(text("""
+            SELECT COUNT(*) FROM students WHERE student_id_number LIKE :pattern
+        """), {"pattern": f"{sy_prefix}-%"}).fetchone()
+        seq = (count_row[0] if count_row else 0) + 1
+        student_id_number = f"{sy_prefix}-{seq:04d}"
+
+        user_result = db.execute(text("""
+            INSERT INTO users (username, password_hash, role, status)
+            VALUES (:username, :password_hash, 'student', 'active')
+        """), {"username": student_id_number, "password_hash": student_id_number})
+        new_user_id = user_result.lastrowid
+        db.commit()
+
+        db.execute(text("""
+            UPDATE students
+            SET user_id = :user_id, student_id_number = :sid_number
+            WHERE id = :sid
+        """), {"user_id": new_user_id, "sid_number": student_id_number, "sid": data["student_id"]})
+        db.commit()
+
+    if section_id is not None:
+        db.execute(text("""
+            UPDATE students SET section_id = :section_id WHERE id = :sid
+        """), {"section_id": section_id, "sid": data["student_id"]})
+        db.commit()
 
     db.execute(text("""
         UPDATE applications SET status = 'officially_enrolled' WHERE id = :id
@@ -1030,4 +1070,15 @@ def complete_application(application_id: int, db: Session = Depends(get_db)):
     )
     send_email(data["email"], subject, body)
 
-    return {"message": "Application marked officially enrolled, email sent"}
+    # Re-fetch the current student_id_number (whether just generated above,
+    # or already existing from a prior run) so the caller can pass it along
+    # to the student in the enrollment confirmation.
+    final_row = db.execute(text(
+        "SELECT student_id_number FROM students WHERE id = :sid"
+    ), {"sid": data["student_id"]}).fetchone()
+    student_id_number = final_row[0] if final_row else None
+
+    return {
+        "message": "Application marked officially enrolled, email sent",
+        "student_id_number": student_id_number
+    }
