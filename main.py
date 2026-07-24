@@ -580,6 +580,245 @@ def delete_grade(grade_id: int, db: Session = Depends(get_db)):
 
 
 # ============================================================
+# ATTENDANCE
+# marked_by distinguishes who logged the record - 'teacher' for
+# everything today. The mobile-app self-log feature (older students
+# marking their own attendance) will write 'student' here later, so
+# the enum already has room for it without a schema change.
+# ============================================================
+class AttendanceEntry(BaseModel):
+    student_id: int
+    status: str    # 'present', 'absent', 'late', 'excused' - matches DB enum
+
+
+class AttendanceBulkSave(BaseModel):
+    section_subject_teacher_id: int
+    date: str          # "YYYY-MM-DD"
+    entries: List[AttendanceEntry]
+
+
+class AttendanceOverride(BaseModel):
+    status: str
+
+
+@app.get("/assignments/{sstid}/attendance")
+def get_attendance_for_date(sstid: int, date: str, db: Session = Depends(get_db)):
+    """Roster for this class + whatever attendance is already recorded for
+    that date, so the Take Attendance tab can pre-fill from a re-opened day."""
+    section_row = db.execute(text(
+        "SELECT section_id FROM section_subject_teacher WHERE id = :id"
+    ), {"id": sstid}).fetchone()
+    if not section_row:
+        raise HTTPException(status_code=404, detail="Class assignment not found")
+    section_id = section_row[0]
+
+    roster = db.execute(text("""
+        SELECT id AS student_id, student_id_number, first_name, last_name
+        FROM students WHERE section_id = :sid
+        ORDER BY last_name, first_name
+    """), {"sid": section_id}).fetchall()
+
+    existing = db.execute(text("""
+        SELECT id, student_id, status FROM attendance
+        WHERE section_subject_teacher_id = :sstid AND date = :date
+    """), {"sstid": sstid, "date": date}).fetchall()
+    existing_map = {r[1]: {"attendance_id": r[0], "status": r[2]} for r in existing}
+
+    result = []
+    for s in roster:
+        srow = dict(s._mapping)
+        marked = existing_map.get(srow["student_id"])
+        srow["attendance_id"] = marked["attendance_id"] if marked else None
+        srow["status"] = marked["status"] if marked else None
+        result.append(srow)
+    return result
+
+
+@app.post("/attendance/bulk")
+def save_attendance_bulk(payload: AttendanceBulkSave, db: Session = Depends(get_db)):
+    saved = 0
+    for entry in payload.entries:
+        existing = db.execute(text("""
+            SELECT id FROM attendance
+            WHERE student_id = :sid AND section_subject_teacher_id = :sstid AND date = :date
+        """), {"sid": entry.student_id, "sstid": payload.section_subject_teacher_id, "date": payload.date}).fetchone()
+
+        if existing:
+            db.execute(text("""
+                UPDATE attendance SET status = :status, marked_by = 'teacher', synced = 1
+                WHERE id = :id
+            """), {"status": entry.status, "id": existing[0]})
+        else:
+            db.execute(text("""
+                INSERT INTO attendance (student_id, section_subject_teacher_id, date, status, marked_by, synced)
+                VALUES (:sid, :sstid, :date, :status, 'teacher', 1)
+            """), {
+                "sid": entry.student_id, "sstid": payload.section_subject_teacher_id,
+                "date": payload.date, "status": entry.status
+            })
+        saved += 1
+    db.commit()
+    return {"message": f"Saved attendance for {saved} student(s)"}
+
+
+@app.get("/assignments/{sstid}/attendance/records")
+def get_attendance_records(
+    sstid: int,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    query = """
+        SELECT a.id, a.student_id, s.first_name, s.last_name, s.student_id_number,
+               a.date, a.status, a.marked_by
+        FROM attendance a
+        JOIN students s ON a.student_id = s.id
+        WHERE a.section_subject_teacher_id = :sstid
+    """
+    params = {"sstid": sstid}
+    if date_from:
+        query += " AND a.date >= :date_from"
+        params["date_from"] = date_from
+    if date_to:
+        query += " AND a.date <= :date_to"
+        params["date_to"] = date_to
+    query += " ORDER BY a.date DESC, s.last_name, s.first_name"
+
+    rows = db.execute(text(query), params).fetchall()
+    result = []
+    for r in rows:
+        item = dict(r._mapping)
+        if item.get("date"):
+            item["date"] = str(item["date"])
+        result.append(item)
+    return result
+
+
+@app.put("/attendance/{attendance_id}")
+def override_attendance(attendance_id: int, payload: AttendanceOverride, db: Session = Depends(get_db)):
+    existing = db.execute(text("SELECT id FROM attendance WHERE id = :id"), {"id": attendance_id}).fetchone()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Attendance record not found")
+    db.execute(text(
+        "UPDATE attendance SET status = :status WHERE id = :id"
+    ), {"status": payload.status, "id": attendance_id})
+    db.commit()
+    return {"message": "Attendance record updated"}
+
+
+# ============================================================
+# TEACHER REPORTS / ANALYTICS
+# Computes a provisional final grade per student per class:
+#   final = written_works% * 0.40 + performance_tasks% * 0.40 + term_exam% * 0.20
+# A category's % is the average of (score/max_score*100) across every
+# graded item in that category for that student in that class, across
+# all terms recorded so far (not just one term) - this is deliberately
+# a running/provisional view for early-warning purposes, not an
+# official quarterly grade computation.
+# If a student has no graded items in a category yet, that category is
+# left out and the remaining weights are rescaled so the provisional
+# grade is still meaningful with partial data. A student with zero
+# graded items in ANY category is excluded entirely (nothing to assess).
+# Passing threshold: 75.
+# ============================================================
+PASSING_GRADE = 75
+CATEGORY_WEIGHTS = {"written_work": 0.40, "performance_task": 0.40, "term_exam": 0.20}
+
+
+def _compute_class_report(db: Session, sstid: int, section_id: int):
+    roster = db.execute(text("""
+        SELECT id AS student_id, first_name, last_name
+        FROM students WHERE section_id = :sid
+    """), {"sid": section_id}).fetchall()
+
+    cat_rows = db.execute(text("""
+        SELECT student_id, category, AVG(score / max_score * 100) AS pct
+        FROM grades
+        WHERE section_subject_teacher_id = :sstid AND score IS NOT NULL AND max_score > 0
+        GROUP BY student_id, category
+    """), {"sstid": sstid}).fetchall()
+
+    by_student: Dict[int, Dict[str, float]] = {}
+    for r in cat_rows:
+        by_student.setdefault(r[0], {})[r[1]] = float(r[2])
+
+    passing, failing, at_risk = 0, 0, []
+    for s in roster:
+        srow = dict(s._mapping)
+        cats = by_student.get(srow["student_id"])
+        if not cats:
+            continue   # nothing graded yet - can't assess
+
+        total_weight = sum(CATEGORY_WEIGHTS[c] for c in cats if c in CATEGORY_WEIGHTS)
+        if total_weight == 0:
+            continue
+        final = sum(cats[c] * CATEGORY_WEIGHTS[c] for c in cats if c in CATEGORY_WEIGHTS) / total_weight
+
+        if final >= PASSING_GRADE:
+            passing += 1
+        else:
+            failing += 1
+            at_risk.append({
+                "student_id": srow["student_id"],
+                "first_name": srow["first_name"],
+                "last_name": srow["last_name"],
+                "final_grade": round(final, 1),
+                "section_subject_teacher_id": sstid,
+            })
+
+    return passing, failing, at_risk
+
+
+@app.get("/teachers/{teacher_id}/reports")
+def get_teacher_reports(teacher_id: int, db: Session = Depends(get_db)):
+    assignments = db.execute(text("""
+        SELECT sst.id AS sstid, sst.section_id, sec.grade_level, sec.section_name, sub.name AS subject_name
+        FROM section_subject_teacher sst
+        JOIN sections sec ON sst.section_id = sec.id
+        JOIN subjects sub ON sst.subject_id = sub.id
+        WHERE sst.teacher_id = :tid
+    """), {"tid": teacher_id}).fetchall()
+
+    by_section = []
+    all_at_risk = []
+    total_passing, total_failing = 0, 0
+
+    for a in assignments:
+        arow = dict(a._mapping)
+        passing, failing, at_risk = _compute_class_report(db, arow["sstid"], arow["section_id"])
+        total_passing += passing
+        total_failing += failing
+
+        for student in at_risk:
+            student["grade_level"] = arow["grade_level"]
+            student["section_name"] = arow["section_name"]
+            student["subject_name"] = arow["subject_name"]
+            all_at_risk.append(student)
+
+        by_section.append({
+            "section_subject_teacher_id": arow["sstid"],
+            "grade_level": arow["grade_level"],
+            "section_name": arow["section_name"],
+            "subject_name": arow["subject_name"],
+            "passing": passing,
+            "failing": failing,
+            "total_assessed": passing + failing,
+        })
+
+    all_at_risk.sort(key=lambda x: x["final_grade"])
+
+    return {
+        "summary": {
+            "total_assessed": total_passing + total_failing,
+            "passing": total_passing,
+            "failing": total_failing,
+        },
+        "by_section": by_section,
+        "at_risk_students": all_at_risk,
+    }
+
+
+# ============================================================
 # WEBSITE CONTENT ENDPOINTS
 # ============================================================
 
