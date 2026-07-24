@@ -5,8 +5,9 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import os
 import json
+import re
 import smtplib
-from datetime import date
+from datetime import date, datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -804,7 +805,7 @@ def list_applications(
 ):
     query = """
         SELECT a.id, a.application_type, a.grade_level, a.status,
-               a.submitted_at, a.reviewed_at,
+               a.submitted_at, a.reviewed_at, a.enrolled_at,
                s.id AS student_id, s.first_name, s.last_name, s.email, s.phone_number
         FROM applications a
         JOIN students s ON a.student_id = s.id
@@ -830,6 +831,8 @@ def list_applications(
             r["submitted_at"] = str(r["submitted_at"])
         if r.get("reviewed_at"):
             r["reviewed_at"] = str(r["reviewed_at"])
+        if r.get("enrolled_at"):
+            r["enrolled_at"] = str(r["enrolled_at"])
         rows.append(r)
     return rows
 
@@ -843,7 +846,7 @@ def get_application(application_id: int, db: Session = Depends(get_db)):
                a.school_year_id, sy.label AS school_year_label,
                {detail_columns},
                a.als_availability_schedule,
-               a.submitted_at, a.reviewed_at, a.reviewed_by,
+               a.submitted_at, a.reviewed_at, a.enrolled_at, a.reviewed_by,
                s.id AS student_id, s.first_name, s.last_name, s.email, s.phone_number,
                s.student_id_number
         FROM applications a
@@ -856,7 +859,7 @@ def get_application(application_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Application not found")
 
     application = dict(app_row._mapping)
-    for date_field in ("submitted_at", "reviewed_at", "birthdate", "sign_date"):
+    for date_field in ("submitted_at", "reviewed_at", "enrolled_at", "birthdate", "sign_date"):
         if application.get(date_field):
             application[date_field] = str(application[date_field])
 
@@ -992,8 +995,8 @@ def verify_requirement(item_id: int, verified: bool = True, db: Session = Depend
 @app.put("/applications/{application_id}/complete")
 def complete_application(application_id: int, section_id: Optional[int] = None, db: Session = Depends(get_db)):
     row = db.execute(text("""
-        SELECT a.student_id, a.school_year_id, s.email, s.first_name, s.last_name,
-               s.user_id, s.student_id_number
+        SELECT a.student_id, a.school_year_id, a.middle_name, a.birthdate,
+               s.email, s.first_name, s.last_name, s.user_id, s.student_id_number
         FROM applications a JOIN students s ON a.student_id = s.id
         WHERE a.id = :id
     """), {"id": application_id}).fetchone()
@@ -1002,7 +1005,7 @@ def complete_application(application_id: int, section_id: Optional[int] = None, 
 
     unverified_count = db.execute(text("""
         SELECT COUNT(*) FROM application_requirements
-        WHERE application_id = :id AND verified_by_registrar = 0
+        WHERE application_id = :id AND declared_by_student = 1 AND verified_by_registrar = 0
     """), {"id": application_id}).scalar()
 
     if unverified_count > 0:
@@ -1014,9 +1017,16 @@ def complete_application(application_id: int, section_id: Optional[int] = None, 
     data = dict(row._mapping)
 
     # Create the student's login account now, if one doesn't already exist.
-    # Mirrors the pattern already used for teacher accounts above: username
-    # and initial password are both the generated ID (flagged there as a
-    # TODO to replace with a real hash - same TODO applies here).
+    # Per the current plan: username is first+middle+last name with all
+    # spaces/punctuation stripped and lowercased, plus the day-of-month of
+    # their birthdate (e.g. "John Michael Kintao", born Oct 14 ->
+    # "johnmichaelkintao14"). Password is the generated student ID number.
+    # If that combination still collides (e.g. twins sharing a birthdate),
+    # a counter is appended to the username - the student ID number itself
+    # stays unique regardless.
+    # NOTE: password_hash stores the raw student ID as a placeholder,
+    # same TODO as the teacher accounts above - replace with a real
+    # hash before this handles real student data at scale.
     if not data["user_id"]:
         sy_row = db.execute(text(
             "SELECT label FROM school_years WHERE id = :id"
@@ -1030,10 +1040,35 @@ def complete_application(application_id: int, section_id: Optional[int] = None, 
         seq = (count_row[0] if count_row else 0) + 1
         student_id_number = f"{sy_prefix}-{seq:04d}"
 
+        base_username = re.sub(
+            r"[^a-z]", "",
+            f"{data['first_name']}{data['middle_name'] or ''}{data['last_name']}".lower()
+        )
+        birth_day = ""
+        if data["birthdate"]:
+            try:
+                bd = data["birthdate"]
+                if isinstance(bd, str):
+                    bd = datetime.strptime(bd[:10], "%Y-%m-%d").date()
+                birth_day = str(bd.day)
+            except (ValueError, TypeError):
+                birth_day = ""  # malformed/missing birthdate - fall back to name-only
+        base_username = f"{base_username}{birth_day}"
+
+        # Name + birth-day is usually unique, but not guaranteed (e.g. twins
+        # sharing a birthdate). Fall back to appending a counter if needed.
+        username = base_username
+        attempt = 1
+        while db.execute(text(
+            "SELECT id FROM users WHERE username = :u"
+        ), {"u": username}).fetchone():
+            attempt += 1
+            username = f"{base_username}{attempt}"
+
         user_result = db.execute(text("""
             INSERT INTO users (username, password_hash, role, status)
             VALUES (:username, :password_hash, 'student', 'active')
-        """), {"username": student_id_number, "password_hash": student_id_number})
+        """), {"username": username, "password_hash": student_id_number})
         new_user_id = user_result.lastrowid
         db.commit()
 
@@ -1051,7 +1086,7 @@ def complete_application(application_id: int, section_id: Optional[int] = None, 
         db.commit()
 
     db.execute(text("""
-        UPDATE applications SET status = 'officially_enrolled' WHERE id = :id
+        UPDATE applications SET status = 'officially_enrolled', enrolled_at = NOW() WHERE id = :id
     """), {"id": application_id})
     db.execute(text("""
         UPDATE students SET enrollment_status = 'officially_enrolled' WHERE id = :sid
@@ -1070,15 +1105,19 @@ def complete_application(application_id: int, section_id: Optional[int] = None, 
     )
     send_email(data["email"], subject, body)
 
-    # Re-fetch the current student_id_number (whether just generated above,
-    # or already existing from a prior run) so the caller can pass it along
-    # to the student in the enrollment confirmation.
-    final_row = db.execute(text(
-        "SELECT student_id_number FROM students WHERE id = :sid"
-    ), {"sid": data["student_id"]}).fetchone()
+    # Re-fetch the current login credentials (whether just generated above,
+    # or already existing from a prior run) so the caller can pass them
+    # along to the student in the enrollment confirmation.
+    final_row = db.execute(text("""
+        SELECT s.student_id_number, u.username
+        FROM students s LEFT JOIN users u ON s.user_id = u.id
+        WHERE s.id = :sid
+    """), {"sid": data["student_id"]}).fetchone()
     student_id_number = final_row[0] if final_row else None
+    login_username = final_row[1] if final_row else None
 
     return {
         "message": "Application marked officially enrolled, email sent",
-        "student_id_number": student_id_number
+        "student_id_number": student_id_number,
+        "username": login_username
     }
