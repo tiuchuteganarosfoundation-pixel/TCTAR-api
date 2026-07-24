@@ -472,29 +472,42 @@ class GradeCreate(BaseModel):
     title: str
     score: Optional[float] = None
     max_score: float
-    status: str = "assigned"  # 'assigned', 'submitted', 'graded', 'missing'
+    status: str = "missing"   # 'submitted', 'missing', 'incomplete' - matches the actual DB enum
     due_date: Optional[str] = None
+    category: str = "written_work"   # 'written_work', 'performance_task', 'term_exam'
+    term: str = "1st Term"           # '1st Term', '2nd Term', '3rd Term'
+    school_year_id: Optional[int] = None  # auto-filled from is_current if not given
 
 
 class GradeUpdate(BaseModel):
     title: Optional[str] = None
     score: Optional[float] = None
     max_score: Optional[float] = None
-    status: Optional[str] = None
+    status: Optional[str] = None   # 'submitted', 'missing', 'incomplete'
     due_date: Optional[str] = None
+    category: Optional[str] = None
+    term: Optional[str] = None
 
 
 @app.get("/grades")
-def list_grades(section_subject_teacher_id: int, db: Session = Depends(get_db)):
-    rows = db.execute(text("""
+def list_grades(section_subject_teacher_id: int, term: Optional[str] = None, db: Session = Depends(get_db)):
+    query = """
         SELECT g.id, g.student_id, s.first_name, s.last_name, s.student_id_number,
                g.assessment_type, g.title, g.score, g.max_score, g.status,
-               g.due_date, g.synced
+               g.due_date, g.synced, g.category, g.term,
+               g.school_year_id, sy.label AS school_year_label
         FROM grades g
         JOIN students s ON g.student_id = s.id
+        LEFT JOIN school_years sy ON g.school_year_id = sy.id
         WHERE g.section_subject_teacher_id = :sstid
-        ORDER BY g.due_date DESC, s.last_name, s.first_name
-    """), {"sstid": section_subject_teacher_id}).fetchall()
+    """
+    params = {"sstid": section_subject_teacher_id}
+    if term:
+        query += " AND g.term = :term"
+        params["term"] = term
+    query += " ORDER BY g.due_date DESC, s.last_name, s.first_name"
+
+    rows = db.execute(text(query), params).fetchall()
     result = []
     for r in rows:
         item = dict(r._mapping)
@@ -506,22 +519,34 @@ def list_grades(section_subject_teacher_id: int, db: Session = Depends(get_db)):
 
 @app.post("/grades")
 def create_grade(payload: GradeCreate, db: Session = Depends(get_db)):
+    school_year_id = payload.school_year_id
+    if school_year_id is None:
+        current_year = db.execute(text(
+            "SELECT id FROM school_years WHERE is_current = 1 LIMIT 1"
+        )).fetchone()
+        school_year_id = current_year[0] if current_year else None
+
     result = db.execute(text("""
         INSERT INTO grades
-            (student_id, section_subject_teacher_id, assessment_type, title,
-             score, max_score, status, due_date, synced)
+            (student_id, section_subject_teacher_id, school_year_id,
+             assessment_type, title, score, max_score, status, due_date,
+             category, term, synced)
         VALUES
-            (:student_id, :sstid, :assessment_type, :title,
-             :score, :max_score, :status, :due_date, 1)
+            (:student_id, :sstid, :school_year_id,
+             :assessment_type, :title, :score, :max_score, :status, :due_date,
+             :category, :term, 1)
     """), {
         "student_id": payload.student_id,
         "sstid": payload.section_subject_teacher_id,
+        "school_year_id": school_year_id,
         "assessment_type": payload.assessment_type,
         "title": payload.title,
         "score": payload.score,
         "max_score": payload.max_score,
         "status": payload.status,
         "due_date": payload.due_date,
+        "category": payload.category,
+        "term": payload.term,
     })
     db.commit()
     return {"message": "Grade created", "id": result.lastrowid}
