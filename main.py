@@ -7,7 +7,8 @@ import os
 import json
 import re
 import smtplib
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+import secrets
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -410,6 +411,37 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
             "must_change_password": bool(teacher_data["must_change_password"]),
         }
 
+    if user_data["role"] == "student":
+        # NOTE: students do NOT get a forced password-change flow, unlike
+        # teachers - deliberate choice given the volume of students and no
+        # self-service password reset feature existing yet. Their initial
+        # password (their student_id_number) is meant to stay usable
+        # indefinitely until a reset feature is built.
+        student = db.execute(text("""
+            SELECT s.id, s.student_id_number, s.first_name, s.last_name,
+                   s.email, s.phone_number, s.section_id,
+                   sec.grade_level, sec.section_name
+            FROM students s
+            LEFT JOIN sections sec ON s.section_id = sec.id
+            WHERE s.user_id = :uid
+        """), {"uid": user_data["id"]}).fetchone()
+        if not student:
+            raise HTTPException(status_code=404, detail="Student record not found for this login")
+        student_data = dict(student._mapping)
+        return {
+            "user_id": user_data["id"],
+            "username": user_data["username"],
+            "role": "student",
+            "student_id": student_data["id"],
+            "student_id_number": student_data["student_id_number"],
+            "first_name": student_data["first_name"],
+            "last_name": student_data["last_name"],
+            "email": student_data["email"],
+            "section_id": student_data["section_id"],
+            "grade_level": student_data["grade_level"],
+            "section_name": student_data["section_name"],
+        }
+
     return {
         "user_id": user_data["id"],
         "username": user_data["username"],
@@ -704,6 +736,217 @@ def override_attendance(attendance_id: int, payload: AttendanceOverride, db: Ses
     ), {"status": payload.status, "id": attendance_id})
     db.commit()
     return {"message": "Attendance record updated"}
+
+
+# ============================================================
+# QR SELF-CHECK-IN ATTENDANCE (Option B - staged, teacher reviews before saving)
+# ============================================================
+# Nothing a student scans ever writes to the real `attendance` table
+# directly. Scans land in attendance_checkins (a pending/staging area).
+# The teacher closes the session, previews the pending list pre-filled
+# into the same Take Attendance screen used for manual attendance, then
+# clicks the SAME Save All button that already exists - QR just becomes
+# a faster way of pre-filling that screen, never a separate auto-save path.
+#
+# Rules (confirmed with the school):
+#   - QR token rotates every 10 seconds.
+#   - A scan is accepted if it matches the current token, OR the token
+#     from the window immediately before (previous_token) as long as
+#     that previous window ended no more than 3 seconds ago. Otherwise
+#     the student is told to scan again.
+#   - present vs. late is decided by comparing the scan's timestamp to
+#     the class's actual scheduled start_time - not by which QR window
+#     they scanned in.
+#   - Self check-in can only ever produce 'present' or 'late' - never
+#     'excused', never 'absent'. Anyone who never scans defaults to
+#     'absent' when the teacher closes the session and reviews.
+#   - Session length is entirely teacher-controlled - stays open until
+#     they explicitly close it, no fixed duration.
+
+TOKEN_WINDOW_SECONDS = 10
+TOKEN_GRACE_SECONDS = 3
+
+
+def _generate_token():
+    return secrets.token_urlsafe(8)
+
+
+class AttendanceScanRequest(BaseModel):
+    student_id: int
+    token: str
+
+
+@app.post("/assignments/{sstid}/attendance-session/start")
+def start_attendance_session(sstid: int, db: Session = Depends(get_db)):
+    assignment = db.execute(text(
+        "SELECT id FROM section_subject_teacher WHERE id = :id"
+    ), {"id": sstid}).fetchone()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Class assignment not found")
+
+    already_open = db.execute(text(
+        "SELECT id FROM attendance_sessions WHERE section_subject_teacher_id = :sstid AND closed_at IS NULL"
+    ), {"sstid": sstid}).fetchone()
+    if already_open:
+        raise HTTPException(status_code=400, detail="A check-in session is already open for this class")
+
+    token = _generate_token()
+    now = datetime.now()
+    result = db.execute(text("""
+        INSERT INTO attendance_sessions
+            (section_subject_teacher_id, session_date, started_at, current_token, token_issued_at)
+        VALUES (:sstid, :session_date, :started_at, :token, :token_issued_at)
+    """), {
+        "sstid": sstid, "session_date": now.date().isoformat(),
+        "started_at": now, "token": token, "token_issued_at": now,
+    })
+    db.commit()
+    return {"session_id": result.lastrowid, "token": token, "window_seconds": TOKEN_WINDOW_SECONDS}
+
+
+@app.get("/attendance-sessions/{session_id}/qr")
+def get_current_qr_token(session_id: int, db: Session = Depends(get_db)):
+    """Teacher app polls this roughly once a second to keep the displayed
+    QR fresh - rotation itself happens here, server-side, the moment the
+    10-second window has elapsed, so there's a single source of truth for
+    what token is 'current' rather than the teacher app timing it locally."""
+    session = db.execute(text(
+        "SELECT id, closed_at, current_token, previous_token, token_issued_at FROM attendance_sessions WHERE id = :id"
+    ), {"id": session_id}).fetchone()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    session_data = dict(session._mapping)
+    if session_data["closed_at"] is not None:
+        raise HTTPException(status_code=400, detail="This session is closed")
+
+    now = datetime.now()
+    elapsed = (now - session_data["token_issued_at"]).total_seconds()
+
+    if elapsed >= TOKEN_WINDOW_SECONDS:
+        new_token = _generate_token()
+        db.execute(text("""
+            UPDATE attendance_sessions
+            SET previous_token = current_token, current_token = :new_token, token_issued_at = :now
+            WHERE id = :id
+        """), {"new_token": new_token, "now": now, "id": session_id})
+        db.commit()
+        current_token = new_token
+        seconds_remaining = TOKEN_WINDOW_SECONDS
+    else:
+        current_token = session_data["current_token"]
+        seconds_remaining = round(TOKEN_WINDOW_SECONDS - elapsed, 1)
+
+    return {"token": current_token, "seconds_remaining": seconds_remaining}
+
+
+@app.post("/attendance-sessions/{session_id}/scan")
+def submit_attendance_scan(session_id: int, payload: AttendanceScanRequest, db: Session = Depends(get_db)):
+    """The endpoint the (future) mobile app calls when a student scans.
+    Built and testable now even though nothing can call it for real yet."""
+    session = db.execute(text("""
+        SELECT s.id, s.closed_at, s.current_token, s.previous_token, s.token_issued_at,
+               s.session_date, s.section_subject_teacher_id, sst.start_time, sst.section_id
+        FROM attendance_sessions s
+        JOIN section_subject_teacher sst ON s.section_subject_teacher_id = sst.id
+        WHERE s.id = :id
+    """), {"id": session_id}).fetchone()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    session_data = dict(session._mapping)
+
+    if session_data["closed_at"] is not None:
+        raise HTTPException(status_code=400, detail="This check-in period has ended.")
+
+    student = db.execute(text(
+        "SELECT id, section_id FROM students WHERE id = :id"
+    ), {"id": payload.student_id}).fetchone()
+    if not student or student[1] != session_data["section_id"]:
+        raise HTTPException(status_code=403, detail="You are not enrolled in this class's section.")
+
+    already = db.execute(text(
+        "SELECT id, computed_status FROM attendance_checkins WHERE attendance_session_id = :sid AND student_id = :stid"
+    ), {"sid": session_id, "stid": payload.student_id}).fetchone()
+    if already:
+        return {"message": "You're already checked in.", "status": already[1]}
+
+    now = datetime.now()
+    elapsed_since_issued = (now - session_data["token_issued_at"]).total_seconds()
+
+    token_valid = False
+    if payload.token == session_data["current_token"]:
+        token_valid = True
+    elif (payload.token == session_data["previous_token"]
+          and session_data["previous_token"] is not None
+          and elapsed_since_issued <= TOKEN_GRACE_SECONDS):
+        token_valid = True
+
+    if not token_valid:
+        raise HTTPException(status_code=400, detail="This code has expired. Please scan again.")
+
+    # present vs. late: compare this scan's timestamp to the class's actual
+    # scheduled start time on the session's date - not which QR window it fell in.
+    scheduled_start = datetime.combine(session_data["session_date"], session_data["start_time"])
+    computed_status = "present" if now <= scheduled_start else "late"
+
+    db.execute(text("""
+        INSERT INTO attendance_checkins (attendance_session_id, student_id, scanned_at, computed_status)
+        VALUES (:sid, :stid, :now, :status)
+    """), {"sid": session_id, "stid": payload.student_id, "now": now, "status": computed_status})
+    db.commit()
+    return {"message": f"Checked in - marked {computed_status}.", "status": computed_status}
+
+
+@app.post("/attendance-sessions/{session_id}/close")
+def close_attendance_session(session_id: int, db: Session = Depends(get_db)):
+    session = db.execute(text(
+        "SELECT id, closed_at FROM attendance_sessions WHERE id = :id"
+    ), {"id": session_id}).fetchone()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session[1] is not None:
+        raise HTTPException(status_code=400, detail="Session is already closed")
+
+    db.execute(text(
+        "UPDATE attendance_sessions SET closed_at = :now WHERE id = :id"
+    ), {"now": datetime.now(), "id": session_id})
+    db.commit()
+    return {"message": "Session closed"}
+
+
+@app.get("/attendance-sessions/{session_id}/preview")
+def preview_attendance_session(session_id: int, db: Session = Depends(get_db)):
+    """Roster pre-filled from this session's check-ins (present/late) with
+    everyone else defaulted to absent - handed straight to the Take
+    Attendance screen for the teacher to review before Save All. Works
+    whether the session is still open or already closed."""
+    session = db.execute(text("""
+        SELECT s.id, s.section_subject_teacher_id, sst.section_id
+        FROM attendance_sessions s
+        JOIN section_subject_teacher sst ON s.section_subject_teacher_id = sst.id
+        WHERE s.id = :id
+    """), {"id": session_id}).fetchone()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    section_id = session[2]
+
+    roster = db.execute(text("""
+        SELECT id AS student_id, student_id_number, first_name, last_name
+        FROM students WHERE section_id = :sid
+        ORDER BY last_name, first_name
+    """), {"sid": section_id}).fetchall()
+
+    checkins = db.execute(text(
+        "SELECT student_id, computed_status FROM attendance_checkins WHERE attendance_session_id = :sid"
+    ), {"sid": session_id}).fetchall()
+    checkin_map = {c[0]: c[1] for c in checkins}
+
+    result = []
+    for s in roster:
+        srow = dict(s._mapping)
+        srow["status"] = checkin_map.get(srow["student_id"], "absent")
+        srow["self_checked_in"] = srow["student_id"] in checkin_map
+        result.append(srow)
+    return result
 
 
 # ============================================================
