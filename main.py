@@ -819,8 +819,89 @@ def get_teacher_reports(teacher_id: int, db: Session = Depends(get_db)):
 
 
 # ============================================================
-# WEBSITE CONTENT ENDPOINTS
+# MESSAGES (student <-> teacher)
 # ============================================================
+# The student mobile app doesn't exist yet, so nothing can send with
+# sender_role='student' until that's built - these endpoints are ready
+# for that day, and already let a teacher message a student directly.
+
+class MessageCreate(BaseModel):
+    student_id: int
+    teacher_id: int
+    sender_role: str  # 'student' or 'teacher'
+    body: str
+    section_subject_teacher_id: Optional[int] = None
+
+
+@app.get("/teachers/{teacher_id}/messages")
+def list_teacher_conversations(teacher_id: int, db: Session = Depends(get_db)):
+    """One row per student the teacher has an active conversation with,
+    most recently active first, with an unread count for each."""
+    rows = db.execute(text("""
+        SELECT
+            s.id AS student_id, s.first_name, s.last_name, s.student_id_number,
+            MAX(m.sent_at) AS last_sent_at,
+            (SELECT body FROM messages m2
+             WHERE m2.student_id = s.id AND m2.teacher_id = :tid
+             ORDER BY m2.sent_at DESC LIMIT 1) AS last_message,
+            SUM(CASE WHEN m.sender_role = 'student' AND m.read_by_recipient = 0 THEN 1 ELSE 0 END) AS unread_count
+        FROM messages m
+        JOIN students s ON m.student_id = s.id
+        WHERE m.teacher_id = :tid
+        GROUP BY s.id, s.first_name, s.last_name, s.student_id_number
+        ORDER BY last_sent_at DESC
+    """), {"tid": teacher_id}).fetchall()
+    result = []
+    for r in rows:
+        item = dict(r._mapping)
+        if item.get("last_sent_at"):
+            item["last_sent_at"] = str(item["last_sent_at"])
+        result.append(item)
+    return result
+
+
+@app.get("/teachers/{teacher_id}/messages/{student_id}")
+def get_conversation_thread(teacher_id: int, student_id: int, db: Session = Depends(get_db)):
+    """Full message history between this teacher and this student,
+    oldest first. Also marks the student's unread messages as read."""
+    db.execute(text("""
+        UPDATE messages SET read_by_recipient = 1
+        WHERE teacher_id = :tid AND student_id = :sid AND sender_role = 'student'
+    """), {"tid": teacher_id, "sid": student_id})
+    db.commit()
+
+    rows = db.execute(text("""
+        SELECT id, sender_role, body, sent_at, read_by_recipient, section_subject_teacher_id
+        FROM messages
+        WHERE teacher_id = :tid AND student_id = :sid
+        ORDER BY sent_at ASC
+    """), {"tid": teacher_id, "sid": student_id}).fetchall()
+    result = []
+    for r in rows:
+        item = dict(r._mapping)
+        if item.get("sent_at"):
+            item["sent_at"] = str(item["sent_at"])
+        result.append(item)
+    return result
+
+
+@app.post("/messages")
+def send_message(payload: MessageCreate, db: Session = Depends(get_db)):
+    if payload.sender_role not in ("student", "teacher"):
+        raise HTTPException(status_code=400, detail="sender_role must be 'student' or 'teacher'")
+    result = db.execute(text("""
+        INSERT INTO messages (student_id, teacher_id, section_subject_teacher_id, sender_role, body)
+        VALUES (:student_id, :teacher_id, :sstid, :sender_role, :body)
+    """), {
+        "student_id": payload.student_id, "teacher_id": payload.teacher_id,
+        "sstid": payload.section_subject_teacher_id,
+        "sender_role": payload.sender_role, "body": payload.body,
+    })
+    db.commit()
+    return {"message": "Message sent", "id": result.lastrowid}
+
+
+
 
 class FAQCreate(BaseModel):
     question: str
