@@ -1144,6 +1144,117 @@ def send_message(payload: MessageCreate, db: Session = Depends(get_db)):
     return {"message": "Message sent", "id": result.lastrowid}
 
 
+# ============================================================
+# STUDENT-FACING ENDPOINTS (for the mobile app)
+# ============================================================
+
+@app.get("/students/{student_id}/subjects")
+def get_student_subjects(student_id: int, db: Session = Depends(get_db)):
+    """Every subject the student is enrolled in, derived from their
+    section_id - mirrors get_teacher_assignments but from the other side."""
+    student = db.execute(text(
+        "SELECT section_id FROM students WHERE id = :id"
+    ), {"id": student_id}).fetchone()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    if not student[0]:
+        return []  # not assigned to a section yet
+
+    rows = db.execute(text("""
+        SELECT sst.id AS section_subject_teacher_id, sub.name AS subject_name,
+               t.id AS teacher_id, t.first_name AS teacher_first_name, t.last_name AS teacher_last_name,
+               sst.schedule_day, sst.start_time, sst.end_time
+        FROM section_subject_teacher sst
+        JOIN subjects sub ON sst.subject_id = sub.id
+        JOIN teachers t ON sst.teacher_id = t.id
+        WHERE sst.section_id = :section_id
+        ORDER BY sst.schedule_day, sst.start_time
+    """), {"section_id": student[0]}).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+@app.get("/students/{student_id}/grades")
+def get_student_grades(student_id: int, term: Optional[str] = None, db: Session = Depends(get_db)):
+    """Read-only, scoped to the student's own records across every
+    subject - same fields as the teacher's /grades endpoint, just
+    filtered by student_id instead of section_subject_teacher_id."""
+    query = """
+        SELECT g.id, g.section_subject_teacher_id, sub.name AS subject_name,
+               g.assessment_type, g.category, g.term, g.title,
+               g.score, g.max_score, g.status, g.due_date
+        FROM grades g
+        JOIN section_subject_teacher sst ON g.section_subject_teacher_id = sst.id
+        JOIN subjects sub ON sst.subject_id = sub.id
+        WHERE g.student_id = :student_id
+    """
+    params = {"student_id": student_id}
+    if term:
+        query += " AND g.term = :term"
+        params["term"] = term
+    query += " ORDER BY sub.name, g.due_date DESC"
+
+    rows = db.execute(text(query), params).fetchall()
+    result = []
+    for r in rows:
+        item = dict(r._mapping)
+        if item.get("due_date"):
+            item["due_date"] = str(item["due_date"])
+        result.append(item)
+    return result
+
+
+@app.get("/students/{student_id}/messages")
+def list_student_conversations(student_id: int, db: Session = Depends(get_db)):
+    """Mirror of list_teacher_conversations - one row per teacher this
+    student has an active conversation with, most recent first."""
+    rows = db.execute(text("""
+        SELECT
+            t.id AS teacher_id, t.first_name AS teacher_first_name, t.last_name AS teacher_last_name,
+            MAX(m.sent_at) AS last_sent_at,
+            (SELECT body FROM messages m2
+             WHERE m2.teacher_id = t.id AND m2.student_id = :sid
+             ORDER BY m2.sent_at DESC LIMIT 1) AS last_message,
+            SUM(CASE WHEN m.sender_role = 'teacher' AND m.read_by_recipient = 0 THEN 1 ELSE 0 END) AS unread_count
+        FROM messages m
+        JOIN teachers t ON m.teacher_id = t.id
+        WHERE m.student_id = :sid
+        GROUP BY t.id, t.first_name, t.last_name
+        ORDER BY last_sent_at DESC
+    """), {"sid": student_id}).fetchall()
+    result = []
+    for r in rows:
+        item = dict(r._mapping)
+        if item.get("last_sent_at"):
+            item["last_sent_at"] = str(item["last_sent_at"])
+        result.append(item)
+    return result
+
+
+@app.get("/students/{student_id}/messages/{teacher_id}")
+def get_student_conversation_thread(student_id: int, teacher_id: int, db: Session = Depends(get_db)):
+    """Mirror of get_conversation_thread - marks the student's unread
+    (teacher-sent) messages as read the moment they open this thread."""
+    db.execute(text("""
+        UPDATE messages SET read_by_recipient = 1
+        WHERE student_id = :sid AND teacher_id = :tid AND sender_role = 'teacher'
+    """), {"sid": student_id, "tid": teacher_id})
+    db.commit()
+
+    rows = db.execute(text("""
+        SELECT id, sender_role, body, sent_at, read_by_recipient, section_subject_teacher_id
+        FROM messages
+        WHERE student_id = :sid AND teacher_id = :tid
+        ORDER BY sent_at ASC
+    """), {"sid": student_id, "tid": teacher_id}).fetchall()
+    result = []
+    for r in rows:
+        item = dict(r._mapping)
+        if item.get("sent_at"):
+            item["sent_at"] = str(item["sent_at"])
+        result.append(item)
+    return result
+
+
 
 
 class FAQCreate(BaseModel):
