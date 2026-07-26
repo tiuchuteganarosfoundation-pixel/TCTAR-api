@@ -480,7 +480,13 @@ def get_teacher_assignments(teacher_id: int, db: Session = Depends(get_db)):
         WHERE sst.teacher_id = :tid
         ORDER BY sec.grade_level, sec.section_name, sst.schedule_day, sst.start_time
     """), {"tid": teacher_id}).fetchall()
-    return [dict(r._mapping) for r in rows]
+    result = []
+    for r in rows:
+        item = dict(r._mapping)
+        item["start_time"] = _format_time_of_day(item.get("start_time"))
+        item["end_time"] = _format_time_of_day(item.get("end_time"))
+        result.append(item)
+    return result
 
 
 @app.get("/sections/{section_id}/students")
@@ -762,6 +768,23 @@ def override_attendance(attendance_id: int, payload: AttendanceOverride, db: Ses
 #     'absent' when the teacher closes the session and reviews.
 #   - Session length is entirely teacher-controlled - stays open until
 #     they explicitly close it, no fixed duration.
+
+def _format_time_of_day(raw):
+    """MySQL TIME columns come back from PyMySQL/SQLAlchemy as
+    datetime.timedelta objects. Left unformatted, FastAPI's default JSON
+    encoder turns those into raw total-seconds floats (e.g. 28800.0
+    instead of '8:00 AM') - this converts to a proper 12-hour clock
+    string once, here, so every client gets the same readable value
+    instead of each one having to know this encoding quirk."""
+    if raw is None:
+        return None
+    total_seconds = int(raw.total_seconds()) if hasattr(raw, "total_seconds") else int(raw)
+    hours24 = (total_seconds // 3600) % 24
+    minutes = (total_seconds % 3600) // 60
+    period = "AM" if hours24 < 12 else "PM"
+    hours12 = 12 if hours24 % 12 == 0 else hours24 % 12
+    return f"{hours12}:{minutes:02d} {period}"
+
 
 TOKEN_WINDOW_SECONDS = 10
 TOKEN_GRACE_SECONDS = 3
@@ -1170,7 +1193,18 @@ def get_student_subjects(student_id: int, db: Session = Depends(get_db)):
         WHERE sst.section_id = :section_id
         ORDER BY sst.schedule_day, sst.start_time
     """), {"section_id": student[0]}).fetchall()
-    return [dict(r._mapping) for r in rows]
+
+    result = []
+    for r in rows:
+        item = dict(r._mapping)
+        # start_time/end_time come back from MySQL as timedelta objects,
+        # which FastAPI's default JSON encoder turns into raw total-seconds
+        # floats (e.g. 28800.0) rather than a readable clock time - format
+        # them properly here instead of leaking that encoding to every client.
+        item["start_time"] = _format_time_of_day(item.get("start_time"))
+        item["end_time"] = _format_time_of_day(item.get("end_time"))
+        result.append(item)
+    return result
 
 
 @app.get("/students/{student_id}/grades")
