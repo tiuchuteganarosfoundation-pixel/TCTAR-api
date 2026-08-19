@@ -1694,24 +1694,90 @@ APPLICATION_DETAIL_FIELDS = [
 ]
 
 
+# ---- PUBLIC: old-student lookup for enrollment form autofill ----
+@app.get("/students/lookup")
+def lookup_student(lrn: Optional[str] = None, student_id_number: Optional[str] = None, db: Session = Depends(get_db)):
+    if not lrn and not student_id_number:
+        raise HTTPException(status_code=400, detail="Provide either lrn or student_id_number")
+
+    detail_columns = ", ".join(f"a.{f}" for f in APPLICATION_DETAIL_FIELDS)
+
+    if student_id_number:
+        where_clause = "s.student_id_number = :value"
+    else:
+        where_clause = "a.lrn = :value"
+    value = student_id_number or lrn
+
+    row = db.execute(text(f"""
+        SELECT s.id AS student_id, s.first_name, s.last_name, s.email, s.phone_number,
+               s.student_id_number, {detail_columns}
+        FROM applications a
+        JOIN students s ON a.student_id = s.id
+        WHERE {where_clause}
+        ORDER BY a.id DESC
+        LIMIT 1
+    """), {"value": value}).fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="No past application found for that LRN/Student ID.")
+
+    result = dict(row._mapping)
+    if result.get("birthdate"):
+        result["birthdate"] = str(result["birthdate"])
+    return result
+
+
 # ---- PUBLIC: enrollment forms submit here ----
 @app.post("/applications")
 def create_application(payload: ApplicationCreate, db: Session = Depends(get_db)):
     if payload.application_type not in ("regular", "als"):
         raise HTTPException(status_code=400, detail="application_type must be 'regular' or 'als'")
 
-    # 1. Create the student record
-    student_result = db.execute(text("""
-        INSERT INTO students (first_name, last_name, email, phone_number, enrollment_status)
-        VALUES (:first_name, :last_name, :email, :phone_number, 'pending')
-    """), {
-        "first_name": payload.first_name,
-        "last_name": payload.last_name,
-        "email": payload.email,
-        "phone_number": payload.phone_number
-    })
-    new_student_id = student_result.lastrowid
-    db.commit()
+    # For a returning ("Lumang Mag-aaral") student, reuse their existing
+    # student record instead of creating a duplicate - matched by LRN
+    # against their most recent past application. If no match is found,
+    # we still create a new record so the form never blocks the student,
+    # but flag it so the registrar knows to double check.
+    existing_student_id = None
+    student_match_status = None
+    if payload.returning_learner == "Lumang Mag-aaral" and payload.lrn:
+        match = db.execute(text("""
+            SELECT student_id FROM applications WHERE lrn = :lrn ORDER BY id DESC LIMIT 1
+        """), {"lrn": payload.lrn}).fetchone()
+        if match:
+            existing_student_id = match[0]
+            student_match_status = "old_student_matched"
+        else:
+            student_match_status = "old_student_no_match_found"
+
+    if existing_student_id:
+        new_student_id = existing_student_id
+        # Refresh contact info in case it changed since their last application.
+        db.execute(text("""
+            UPDATE students SET first_name = :first_name, last_name = :last_name,
+                   email = :email, phone_number = :phone_number
+            WHERE id = :id
+        """), {
+            "first_name": payload.first_name,
+            "last_name": payload.last_name,
+            "email": payload.email,
+            "phone_number": payload.phone_number,
+            "id": existing_student_id
+        })
+        db.commit()
+    else:
+        # 1. Create the student record
+        student_result = db.execute(text("""
+            INSERT INTO students (first_name, last_name, email, phone_number, enrollment_status)
+            VALUES (:first_name, :last_name, :email, :phone_number, 'pending')
+        """), {
+            "first_name": payload.first_name,
+            "last_name": payload.last_name,
+            "email": payload.email,
+            "phone_number": payload.phone_number
+        })
+        new_student_id = student_result.lastrowid
+        db.commit()
 
     # Fall back to whichever school year is marked current if the form
     # didn't specify one.
@@ -1750,27 +1816,32 @@ def create_application(payload: ApplicationCreate, db: Session = Depends(get_db)
     new_app_id = application_result.lastrowid
     db.commit()
 
-    # 3. Build the full requirements checklist for this application type
-    #    ('both' requirements always included, plus type-specific ones)
-    reqs = db.execute(text(
-        "SELECT id FROM requirements WHERE application_type = 'both' OR application_type = :atype"
-    ), {"atype": payload.application_type}).fetchall()
+    # 3. Build the requirements checklist - but only for New/Transferee.
+    #    An old/returning student's documents are already on file from
+    #    their original enrollment, so there's nothing new to declare.
+    if payload.returning_learner != "Lumang Mag-aaral":
+        reqs = db.execute(text(
+            "SELECT id FROM requirements WHERE application_type = 'both' OR application_type = :atype"
+        ), {"atype": payload.application_type}).fetchall()
 
-    declared_set = set(payload.requirement_ids_declared)
-    for row in reqs:
-        rid = row[0]
-        db.execute(text("""
-            INSERT INTO application_requirements
-                (application_id, requirement_id, declared_by_student, verified_by_registrar)
-            VALUES (:aid, :rid, :declared, 0)
-        """), {
-            "aid": new_app_id,
-            "rid": rid,
-            "declared": 1 if rid in declared_set else 0
-        })
-    db.commit()
+        declared_set = set(payload.requirement_ids_declared)
+        for row in reqs:
+            rid = row[0]
+            db.execute(text("""
+                INSERT INTO application_requirements
+                    (application_id, requirement_id, declared_by_student, verified_by_registrar)
+                VALUES (:aid, :rid, :declared, 0)
+            """), {
+                "aid": new_app_id,
+                "rid": rid,
+                "declared": 1 if rid in declared_set else 0
+            })
+        db.commit()
 
-    return {"message": "Application submitted", "application_id": new_app_id, "student_id": new_student_id}
+    response = {"message": "Application submitted", "application_id": new_app_id, "student_id": new_student_id}
+    if student_match_status:
+        response["student_match_status"] = student_match_status
+    return response
 
 
 # ---- School years ----
@@ -1883,7 +1954,8 @@ def get_application(application_id: int, db: Session = Depends(get_db)):
 
     checklist = db.execute(text("""
         SELECT ar.id, ar.requirement_id, r.name, ar.declared_by_student,
-               ar.verified_by_registrar, ar.verified_at
+               ar.verified_by_registrar, ar.verified_at,
+               ar.document_url, ar.document_filename, ar.document_uploaded_at
         FROM application_requirements ar
         JOIN requirements r ON ar.requirement_id = r.id
         WHERE ar.application_id = :id
@@ -1895,6 +1967,8 @@ def get_application(application_id: int, db: Session = Depends(get_db)):
         item = dict(row._mapping)
         if item.get("verified_at"):
             item["verified_at"] = str(item["verified_at"])
+        if item.get("document_uploaded_at"):
+            item["document_uploaded_at"] = str(item["document_uploaded_at"])
         application["requirements"].append(item)
 
     return application
@@ -1996,6 +2070,54 @@ def verify_requirement(item_id: int, verified: bool = True, db: Session = Depend
     if result.rowcount == 0:
         raise HTTPException(status_code=404, detail="Checklist item not found")
     return {"message": "Requirement updated"}
+
+
+# ---- PUBLIC: enrollee uploads a scanned/photographed document for one checklist item ----
+@app.post("/application_requirements/{item_id}/document")
+def upload_requirement_document(item_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
+    if file.content_type not in ALLOWED_TYPES:
+        raise HTTPException(status_code=400, detail="Only JPG, PNG, WEBP, or PDF files are allowed.")
+
+    row = db.execute(text("""
+        SELECT ar.application_id, r.name AS requirement_name, s.first_name, s.last_name
+        FROM application_requirements ar
+        JOIN requirements r ON ar.requirement_id = r.id
+        JOIN applications a ON ar.application_id = a.id
+        JOIN students s ON a.student_id = s.id
+        WHERE ar.id = :id
+    """), {"id": item_id}).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Checklist item not found")
+
+    data = dict(row._mapping)
+    full_name = f"{data['first_name']} {data['last_name']}"
+    # e.g. "PSA Birth Certificate - Juan Dela Cruz" - sanitized for use as a
+    # Cloudinary public_id (letters, numbers, spaces, dashes, underscores only)
+    safe_name = re.sub(r"[^A-Za-z0-9 _-]", "", f"{data['requirement_name']} - {full_name}").strip()
+    display_filename = f"{safe_name}{os.path.splitext(file.filename or '')[1]}"
+
+    try:
+        upload_result = cloudinary.uploader.upload(
+            file.file,
+            folder=f"school_enrollment/applications/{data['application_id']}",
+            public_id=safe_name,
+            overwrite=True,
+            resource_type="auto"  # lets Cloudinary handle images and PDFs correctly
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Document upload failed: {str(e)}")
+
+    document_url = upload_result.get("secure_url")
+
+    db.execute(text("""
+        UPDATE application_requirements
+        SET document_url = :url, document_filename = :fname, document_uploaded_at = NOW()
+        WHERE id = :id
+    """), {"url": document_url, "fname": display_filename, "id": item_id})
+    db.commit()
+
+    return {"message": "Document uploaded", "document_url": document_url, "document_filename": display_filename, "item_id": item_id}
 
 
 # ---- REGISTRAR: finalize enrollment once all requirements are verified (sends email #2) ----
