@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -11,6 +11,8 @@ from datetime import date, datetime, timedelta
 import secrets
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import cloudinary
+import cloudinary.uploader
 
 from database import engine, get_db
 from id_generator import generate_employee_id
@@ -23,6 +25,21 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+# ============================================================
+# CLOUDINARY (file storage for uploaded images/documents)
+# Requires three environment variables set on Render:
+#   CLOUDINARY_CLOUD_NAME
+#   CLOUDINARY_API_KEY
+#   CLOUDINARY_API_SECRET
+# ============================================================
+
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    secure=True
 )
 
 # ============================================================
@@ -1380,6 +1397,70 @@ def update_video(payload: VideoUpdate, db: Session = Depends(get_db)):
     ), {"url": payload.url, "description": payload.description})
     db.commit()
     return {"message": "Video updated", "url": payload.url}
+
+
+# ============================================================
+# PRINCIPAL'S WELCOME SECTION (photo + message, admin-editable)
+# photo_url points to a Cloudinary-hosted image; message_paragraphs
+# is stored as one TEXT column with paragraphs separated by a
+# double newline, and split back into separate <p> tags on the
+# front end.
+# ============================================================
+
+class PrincipalUpdate(BaseModel):
+    name: Optional[str] = None
+    role: Optional[str] = None
+    message: Optional[str] = None
+    signoff: Optional[str] = None
+
+@app.get("/website/principal")
+def get_principal(db: Session = Depends(get_db)):
+    result = db.execute(text(
+        "SELECT id, photo_url, name, role, message, signoff FROM website_principal LIMIT 1"
+    )).fetchone()
+    if not result:
+        return {"photo_url": None, "name": None, "role": None, "message": None, "signoff": None}
+    return dict(result._mapping)
+
+@app.put("/website/principal")
+def update_principal(payload: PrincipalUpdate, db: Session = Depends(get_db)):
+    db.execute(text(
+        "UPDATE website_principal SET name = :name, role = :role, "
+        "message = :message, signoff = :signoff WHERE id = 1"
+    ), {
+        "name": payload.name,
+        "role": payload.role,
+        "message": payload.message,
+        "signoff": payload.signoff
+    })
+    db.commit()
+    return {"message": "Principal info updated"}
+
+@app.post("/website/principal/photo")
+def update_principal_photo(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
+    if file.content_type not in ALLOWED_TYPES:
+        raise HTTPException(status_code=400, detail="Only JPG, PNG, or WEBP images are allowed.")
+
+    try:
+        upload_result = cloudinary.uploader.upload(
+            file.file,
+            folder="school_website/principal",
+            public_id="principal_photo",
+            overwrite=True,
+            resource_type="image"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Image upload failed: {str(e)}")
+
+    photo_url = upload_result.get("secure_url")
+
+    db.execute(text(
+        "UPDATE website_principal SET photo_url = :photo_url WHERE id = 1"
+    ), {"photo_url": photo_url})
+    db.commit()
+
+    return {"message": "Principal photo updated", "photo_url": photo_url}
 
 
 class TestimonialCreate(BaseModel):
