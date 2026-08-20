@@ -1668,6 +1668,90 @@ class ApplicationCreate(BaseModel):
     als_availability_schedule: Optional[Dict[str, Any]] = None
 
 
+# Used by the registrar's "Edit Information" feature. Every field is
+# optional - only whatever the registrar actually changed gets sent, and
+# only those columns get updated. Deliberately excludes application_type
+# (structural, not something to "edit") and requirement_ids_declared
+# (handled by the checklist/upload flow, not this endpoint).
+class ApplicationUpdate(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+    phone_number: Optional[str] = None
+    grade_level: Optional[str] = None
+
+    lrn: Optional[str] = None
+    middle_name: Optional[str] = None
+    ext_name: Optional[str] = None
+    birthdate: Optional[str] = None
+    age: Optional[str] = None
+    sex: Optional[str] = None
+    religion: Optional[str] = None
+    mother_tongue: Optional[str] = None
+    ip_group: Optional[str] = None
+    signer_name: Optional[str] = None
+    sign_date: Optional[str] = None
+
+    current_street: Optional[str] = None
+    current_barangay: Optional[str] = None
+    current_municipality: Optional[str] = None
+    current_province: Optional[str] = None
+    current_zip: Optional[str] = None
+    permanent_same_as_current: Optional[bool] = None
+    permanent_street: Optional[str] = None
+    permanent_barangay: Optional[str] = None
+    permanent_municipality: Optional[str] = None
+    permanent_province: Optional[str] = None
+    permanent_zip: Optional[str] = None
+
+    father_last_name: Optional[str] = None
+    father_first_name: Optional[str] = None
+    father_contact: Optional[str] = None
+    father_occupation: Optional[str] = None
+    mother_last_name: Optional[str] = None
+    mother_first_name: Optional[str] = None
+    mother_contact: Optional[str] = None
+    mother_occupation: Optional[str] = None
+    guardian_last_name: Optional[str] = None
+    guardian_first_name: Optional[str] = None
+    guardian_contact: Optional[str] = None
+
+    ip_member: Optional[str] = None
+    four_ps: Optional[str] = None
+    four_ps_id: Optional[str] = None
+    special_needs: Optional[str] = None
+    disability: Optional[str] = None
+    pwd_id: Optional[str] = None
+    pwd_id_number: Optional[str] = None
+
+    graded_status: Optional[str] = None
+    psa_no: Optional[str] = None
+    place_of_birth: Optional[str] = None
+    returning_learner: Optional[str] = None
+    last_school_year: Optional[str] = None
+    last_grade: Optional[str] = None
+    last_school: Optional[str] = None
+    trimester: Optional[str] = None
+    shs_track: Optional[str] = None
+    shs_strand: Optional[str] = None
+    modality: Optional[str] = None
+
+    civil_status: Optional[str] = None
+    pwd: Optional[str] = None
+    dropout_reason: Optional[str] = None
+    dropout_other: Optional[str] = None
+    als_before: Optional[str] = None
+    als_program_name: Optional[str] = None
+    als_year_attended: Optional[str] = None
+    als_completed: Optional[str] = None
+    als_not_completed_reason: Optional[str] = None
+    distance_km: Optional[str] = None
+    travel_hours: Optional[str] = None
+    travel_mins: Optional[str] = None
+    travel_mode: Optional[str] = None
+    travel_other: Optional[str] = None
+
+
 # Every application-detail column beyond the original 5 basics, used to
 # build the INSERT and the SELECT in one place instead of duplicating the
 # list - add a new field here and to ApplicationCreate above, and both the
@@ -1882,7 +1966,7 @@ def list_applications(
     db: Session = Depends(get_db)
 ):
     query = """
-        SELECT a.id, a.application_type, a.grade_level, a.status,
+        SELECT a.id, a.application_type, a.grade_level, a.status, a.returning_learner,
                a.submitted_at, a.reviewed_at, a.enrolled_at,
                s.id AS student_id, s.first_name, s.last_name, s.email, s.phone_number
         FROM applications a
@@ -1975,6 +2059,39 @@ def get_application(application_id: int, db: Session = Depends(get_db)):
 
 
 # ---- REGISTRAR: approve an application (sends email #1) ----
+# ---- REGISTRAR: edit an application's information (available at any status) ----
+@app.put("/applications/{application_id}")
+def update_application(application_id: int, payload: ApplicationUpdate, db: Session = Depends(get_db)):
+    updates = payload.dict(exclude_unset=True)
+    if not updates:
+        return {"message": "No changes provided"}
+
+    row = db.execute(text("SELECT student_id FROM applications WHERE id = :id"), {"id": application_id}).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Application not found")
+    student_id = row[0]
+
+    # first_name/last_name/email/phone_number live on the students table
+    # (shared across all of a student's applications); everything else
+    # lives on this specific application row.
+    STUDENT_FIELDS = {"first_name", "last_name", "email", "phone_number"}
+    student_updates = {k: v for k, v in updates.items() if k in STUDENT_FIELDS}
+    application_updates = {k: v for k, v in updates.items() if k not in STUDENT_FIELDS}
+
+    if student_updates:
+        set_clause = ", ".join(f"{k} = :{k}" for k in student_updates)
+        db.execute(text(f"UPDATE students SET {set_clause} WHERE id = :student_id"),
+                   {**student_updates, "student_id": student_id})
+
+    if application_updates:
+        set_clause = ", ".join(f"{k} = :{k}" for k in application_updates)
+        db.execute(text(f"UPDATE applications SET {set_clause} WHERE id = :id"),
+                   {**application_updates, "id": application_id})
+
+    db.commit()
+    return {"message": "Application updated", "application_id": application_id}
+
+
 @app.put("/applications/{application_id}/approve")
 def approve_application(application_id: int, db: Session = Depends(get_db)):
     row = db.execute(text("""
