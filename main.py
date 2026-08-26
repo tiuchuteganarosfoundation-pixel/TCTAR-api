@@ -1606,12 +1606,14 @@ class ApplicationCreate(BaseModel):
     current_street: Optional[str] = None
     current_barangay: Optional[str] = None
     current_municipality: Optional[str] = None
+    current_district: Optional[str] = None
     current_province: Optional[str] = None
     current_zip: Optional[str] = None
     permanent_same_as_current: Optional[bool] = None
     permanent_street: Optional[str] = None
     permanent_barangay: Optional[str] = None
     permanent_municipality: Optional[str] = None
+    permanent_district: Optional[str] = None
     permanent_province: Optional[str] = None
     permanent_zip: Optional[str] = None
 
@@ -1695,12 +1697,14 @@ class ApplicationUpdate(BaseModel):
     current_street: Optional[str] = None
     current_barangay: Optional[str] = None
     current_municipality: Optional[str] = None
+    current_district: Optional[str] = None
     current_province: Optional[str] = None
     current_zip: Optional[str] = None
     permanent_same_as_current: Optional[bool] = None
     permanent_street: Optional[str] = None
     permanent_barangay: Optional[str] = None
     permanent_municipality: Optional[str] = None
+    permanent_district: Optional[str] = None
     permanent_province: Optional[str] = None
     permanent_zip: Optional[str] = None
 
@@ -1759,9 +1763,9 @@ class ApplicationUpdate(BaseModel):
 APPLICATION_DETAIL_FIELDS = [
     "lrn", "middle_name", "ext_name", "birthdate", "age", "sex", "religion",
     "mother_tongue", "ip_group", "signer_name", "sign_date",
-    "current_street", "current_barangay", "current_municipality",
+    "current_street", "current_barangay", "current_municipality", "current_district",
     "current_province", "current_zip", "permanent_same_as_current",
-    "permanent_street", "permanent_barangay", "permanent_municipality",
+    "permanent_street", "permanent_barangay", "permanent_municipality", "permanent_district",
     "permanent_province", "permanent_zip",
     "father_last_name", "father_first_name", "father_contact", "father_occupation",
     "mother_last_name", "mother_first_name", "mother_contact", "mother_occupation",
