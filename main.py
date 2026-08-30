@@ -824,6 +824,22 @@ def start_attendance_session(sstid: int, db: Session = Depends(get_db)):
     if not assignment:
         raise HTTPException(status_code=404, detail="Class assignment not found")
 
+    # Auto-close any session left open from a crash, force-quit, or the
+    # teacher closing the QR dialog some way other than the dedicated
+    # "Close Session" button - none of those paths ever set closed_at,
+    # so without this, one abandoned session would block starting a new
+    # one for this class forever. 2 hours is a generous upper bound for
+    # a single class period; anything older is clearly abandoned, not a
+    # legitimately still-running check-in.
+    db.execute(text("""
+        UPDATE attendance_sessions
+        SET closed_at = NOW()
+        WHERE section_subject_teacher_id = :sstid
+          AND closed_at IS NULL
+          AND started_at < :cutoff
+    """), {"sstid": sstid, "cutoff": datetime.now() - timedelta(hours=2)})
+    db.commit()
+
     already_open = db.execute(text(
         "SELECT id FROM attendance_sessions WHERE section_subject_teacher_id = :sstid AND closed_at IS NULL"
     ), {"sstid": sstid}).fetchone()
@@ -1119,19 +1135,40 @@ class MessageCreate(BaseModel):
 @app.get("/teachers/{teacher_id}/messages")
 def list_teacher_conversations(teacher_id: int, db: Session = Depends(get_db)):
     """One row per student the teacher has an active conversation with,
-    most recently active first, with an unread count for each."""
+    most recently active first, with an unread count for each.
+
+    subject_name/grade_level/section_name reflect whichever class this
+    conversation started under - only the very first message of a new
+    conversation ever has section_subject_teacher_id set (see
+    NewMessageDialog vs a plain reply), so later replies within the same
+    thread are ignored here and this always resolves to that one
+    original class context. Any of the three can be null if this
+    conversation predates that field existing at all.
+    """
     rows = db.execute(text("""
         SELECT
             s.id AS student_id, s.first_name, s.last_name, s.student_id_number,
             MAX(m.sent_at) AS last_sent_at,
             (SELECT body FROM messages m2
              WHERE m2.student_id = s.id AND m2.teacher_id = :tid
-             ORDER BY m2.sent_at DESC LIMIT 1) AS last_message,
-            SUM(CASE WHEN m.sender_role = 'student' AND m.read_by_recipient = 0 THEN 1 ELSE 0 END) AS unread_count
+             ORDER BY m2.sent_at DESC, m2.id DESC LIMIT 1) AS last_message,
+            SUM(CASE WHEN m.sender_role = 'student' AND m.read_by_recipient = 0 THEN 1 ELSE 0 END) AS unread_count,
+            sub.name AS subject_name,
+            sec.grade_level AS grade_level,
+            sec.section_name AS section_name
         FROM messages m
         JOIN students s ON m.student_id = s.id
+        LEFT JOIN section_subject_teacher sst ON sst.id = (
+            SELECT m3.section_subject_teacher_id FROM messages m3
+            WHERE m3.student_id = s.id AND m3.teacher_id = :tid
+              AND m3.section_subject_teacher_id IS NOT NULL
+            ORDER BY m3.sent_at ASC, m3.id ASC LIMIT 1
+        )
+        LEFT JOIN sections sec ON sst.section_id = sec.id
+        LEFT JOIN subjects sub ON sst.subject_id = sub.id
         WHERE m.teacher_id = :tid
-        GROUP BY s.id, s.first_name, s.last_name, s.student_id_number
+        GROUP BY s.id, s.first_name, s.last_name, s.student_id_number,
+                 sub.name, sec.grade_level, sec.section_name
         ORDER BY last_sent_at DESC
     """), {"tid": teacher_id}).fetchall()
     result = []
