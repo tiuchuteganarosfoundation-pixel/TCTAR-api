@@ -803,6 +803,18 @@ def _format_time_of_day(raw):
     return f"{hours12}:{minutes:02d} {period}"
 
 
+def _sql_time_to_pytime(raw):
+    """Same underlying quirk as _format_time_of_day above, but returns
+    an actual datetime.time object instead of a display string - use
+    this wherever the value needs to go into datetime.combine() or any
+    other real time-of-day comparison, not just be shown to a user."""
+    if raw is None:
+        return None
+    if hasattr(raw, "total_seconds"):
+        return (datetime.min + timedelta(seconds=int(raw.total_seconds()))).time()
+    return raw
+
+
 TOKEN_WINDOW_SECONDS = 10
 TOKEN_GRACE_SECONDS = 3
 
@@ -816,13 +828,61 @@ class AttendanceScanRequest(BaseModel):
     token: str
 
 
+class AttendanceSessionStartRequest(BaseModel):
+    override_username: Optional[str] = None
+    override_password: Optional[str] = None
+
+
 @app.post("/assignments/{sstid}/attendance-session/start")
-def start_attendance_session(sstid: int, db: Session = Depends(get_db)):
+def start_attendance_session(
+    sstid: int,
+    payload: Optional[AttendanceSessionStartRequest] = None,
+    db: Session = Depends(get_db),
+):
     assignment = db.execute(text(
-        "SELECT id FROM section_subject_teacher WHERE id = :id"
+        "SELECT id, start_time, end_time FROM section_subject_teacher WHERE id = :id"
     ), {"id": sstid}).fetchone()
     if not assignment:
         raise HTTPException(status_code=404, detail="Class assignment not found")
+    assignment_data = dict(assignment._mapping)
+
+    # QR check-in is restricted to the class's actual scheduled time
+    # window (today's date + the registered start_time/end_time, the
+    # same values set from the VB6 admin app's Assignments screen).
+    # Only the TIME matters here, not schedule_day - a class can be
+    # moved to run on a different day while keeping its usual time
+    # slot, so day-of-week is deliberately not enforced.
+    #
+    # A teacher (or anyone with a valid, active login) can bypass this
+    # by supplying override_username/override_password - meant for
+    # legitimately rescheduled or makeup classes, not a fixed PIN, so
+    # it's checked against real accounts the same way /login does.
+    now = datetime.now()
+    start_t = _sql_time_to_pytime(assignment_data["start_time"])
+    end_t = _sql_time_to_pytime(assignment_data["end_time"])
+    window_start = datetime.combine(now.date(), start_t)
+    window_end = datetime.combine(now.date(), end_t)
+
+    if not (window_start <= now <= window_end):
+        override_ok = False
+        if payload and payload.override_username and payload.override_password:
+            override_user = db.execute(text("""
+                SELECT id, status FROM users
+                WHERE username = :username AND password_hash = :password
+            """), {
+                "username": payload.override_username,
+                "password": payload.override_password,
+            }).fetchone()
+            override_ok = override_user is not None and override_user[1] == "active"
+        if not override_ok:
+            window_label = f"{start_t.strftime('%I:%M %p').lstrip('0')} - {end_t.strftime('%I:%M %p').lstrip('0')}"
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"QR check-in is only available during this class's scheduled time "
+                    f"({window_label}). Enter a valid username and password to start it anyway."
+                ),
+            )
 
     # Auto-close any session left open from a crash, force-quit, or the
     # teacher closing the QR dialog some way other than the dedicated
@@ -837,7 +897,7 @@ def start_attendance_session(sstid: int, db: Session = Depends(get_db)):
         WHERE section_subject_teacher_id = :sstid
           AND closed_at IS NULL
           AND started_at < :cutoff
-    """), {"sstid": sstid, "cutoff": datetime.now() - timedelta(hours=2)})
+    """), {"sstid": sstid, "cutoff": now - timedelta(hours=2)})
     db.commit()
 
     already_open = db.execute(text(
@@ -847,7 +907,6 @@ def start_attendance_session(sstid: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="A check-in session is already open for this class")
 
     token = _generate_token()
-    now = datetime.now()
     result = db.execute(text("""
         INSERT INTO attendance_sessions
             (section_subject_teacher_id, session_date, started_at, current_token, token_issued_at)
@@ -941,7 +1000,8 @@ def submit_attendance_scan(session_id: int, payload: AttendanceScanRequest, db: 
 
     # present vs. late: compare this scan's timestamp to the class's actual
     # scheduled start time on the session's date - not which QR window it fell in.
-    scheduled_start = datetime.combine(session_data["session_date"], session_data["start_time"])
+    start_time_obj = _sql_time_to_pytime(session_data["start_time"])
+    scheduled_start = datetime.combine(session_data["session_date"], start_time_obj)
     computed_status = "present" if now <= scheduled_start else "late"
 
     db.execute(text("""
@@ -949,7 +1009,18 @@ def submit_attendance_scan(session_id: int, payload: AttendanceScanRequest, db: 
         VALUES (:sid, :stid, :now, :status)
     """), {"sid": session_id, "stid": payload.student_id, "now": now, "status": computed_status})
     db.commit()
-    return {"message": f"Checked in - marked {computed_status}.", "status": computed_status}
+    return {
+        "message": f"Checked in - marked {computed_status}.",
+        "status": computed_status,
+        # TEMPORARY DIAGNOSTIC - remove once confirmed. Compare this
+        # against your real Philippine-time clock at the moment you
+        # scan: if this is ~8 hours BEHIND your real time, the server
+        # is running UTC and this endpoint needs the same +8 fix
+        # already applied to message timestamps. If it MATCHES your
+        # real time, the server is already correctly configured and
+        # nothing here needs to change.
+        "debug_server_now": now.isoformat(),
+    }
 
 
 @app.post("/attendance-sessions/{session_id}/close")
